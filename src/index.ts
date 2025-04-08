@@ -138,10 +138,13 @@ export default {
 			// Run the update function
 			return await update(clientOptions, record, env);
 		} catch (error) {
-			const errMsg = error instanceof HttpError ? error.message : 'Internal Server Error';
-			console.log('Error updating DNS record: ' + errMsg);
-			await pushNtfy('Error updating DNS record: ' + errMsg, env);
-			return new Response(errMsg, { status: error instanceof HttpError ? error.statusCode : 500 });
+			if (error instanceof HttpError) {
+				console.log('Error updating DNS record: ' + error.message);
+				return new Response(error.message, { status: error.statusCode });
+			} else {
+				console.log('Error updating DNS record: ' + error);
+				return new Response('Internal Server Error', { status: 500 });
+			}
 		}
 	},
 } satisfies ExportedHandler<Env>;
