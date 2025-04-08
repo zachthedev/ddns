@@ -1,8 +1,10 @@
 #:schema node_modules/wrangler/config-schema.json
-name = "unifi-cloudflare-ddns"
+name = "ddns"
 main = "src/index.ts"
 compatibility_date = "2024-12-18"
 compatibility_flags = ["nodejs_compat"]
+
+routes = [{ pattern = "ddns.quist.network", custom_domain = true }]
 
 # Workers Logs
 # Docs: https://developers.cloudflare.com/workers/observability/logs/workers-logs/
