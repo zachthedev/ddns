@@ -59,7 +59,20 @@ function constructDNSRecord(request: Request): AddressableRecord {
 	};
 }
 
-async function update(clientOptions: ClientOptions, newRecord: AddressableRecord): Promise<Response> {
+async function pushNtfy(message: string, env: Env): Promise<void> {
+	if (!env.NTFY_URL) return;
+	try {
+		await fetch(env.NTFY_URL, {
+			method: 'POST',
+			body: message,
+			headers: { 'Content-Type': 'text/plain' },
+		});
+	} catch (e) {
+		console.error('Failed to send ntfy update:', e);
+	}
+}
+
+async function update(clientOptions: ClientOptions, newRecord: AddressableRecord, env: Env): Promise<Response> {
 	const cloudflare = new Cloudflare(clientOptions);
 
 	const tokenStatus = (await cloudflare.user.tokens.verify()).status;
@@ -104,13 +117,15 @@ async function update(clientOptions: ClientOptions, newRecord: AddressableRecord
 		comment, // Pass the existing "comment"
 	});
 
-	console.log('DNS record for ' + newRecord.name + '(' + newRecord.type + ') updated successfully to ' + newRecord.content);
+	const successMsg = `DNS record for ${newRecord.name} (${newRecord.type}) updated successfully to ${newRecord.content}`;
+	console.log(successMsg);
+	await pushNtfy(successMsg, env);
 
 	return new Response('OK', { status: 200 });
 }
 
 export default {
-	async fetch(request): Promise<Response> {
+	async fetch(request: Request, env: Env): Promise<Response> {
 		console.log('Requester IP: ' + request.headers.get('CF-Connecting-IP'));
 		console.log(request.method + ': ' + request.url);
 		console.log('Body: ' + (await request.text()));
@@ -121,15 +136,12 @@ export default {
 			const record = constructDNSRecord(request);
 
 			// Run the update function
-			return await update(clientOptions, record);
+			return await update(clientOptions, record, env);
 		} catch (error) {
-			if (error instanceof HttpError) {
-				console.log('Error updating DNS record: ' + error.message);
-				return new Response(error.message, { status: error.statusCode });
-			} else {
-				console.log('Error updating DNS record: ' + error);
-				return new Response('Internal Server Error', { status: 500 });
-			}
+			const errMsg = error instanceof HttpError ? error.message : 'Internal Server Error';
+			console.log('Error updating DNS record: ' + errMsg);
+			await pushNtfy('Error updating DNS record: ' + errMsg, env);
+			return new Response(errMsg, { status: error instanceof HttpError ? error.statusCode : 500 });
 		}
 	},
 } satisfies ExportedHandler<Env>;
