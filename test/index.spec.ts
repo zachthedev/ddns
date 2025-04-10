@@ -95,11 +95,12 @@ describe('UniFi DDNS Worker', () => {
 		});
 
 		expect(response.status).toBe(401);
-		expect(await response.text()).toBe('API Token status: inactive');
+		expect(await response.text()).toBe("API Token status: 'inactive'");
 	});
 
 	it('responds with 422 when IP is missing', async () => {
 		mockVerify.mockResolvedValueOnce({ status: 'active' });
+
 		const response = await SELF.fetch('http://example.com/update?hostname=home.example.com', {
 			headers: {
 				Authorization: 'Basic ' + btoa('email@example.com:validtoken'),
@@ -111,6 +112,7 @@ describe('UniFi DDNS Worker', () => {
 
 	it('responds with 500 when IP is set to auto and is missing', async () => {
 		mockVerify.mockResolvedValueOnce({ status: 'active' });
+
 		const response = await SELF.fetch('http://example.com/update?hostname=home.example.com&ip=auto', {
 			headers: {
 				Authorization: 'Basic ' + btoa('email@example.com:validtoken'),
@@ -120,8 +122,9 @@ describe('UniFi DDNS Worker', () => {
 		expect(await response.text()).toBe('ip=auto specified but client IP could not be determined.');
 	});
 
-	it('responds with 422 when hostname is missing', async () => {
+	it('responds with 422 when hostname parameter is missing', async () => {
 		mockVerify.mockResolvedValueOnce({ status: 'active' });
+
 		const response = await SELF.fetch('http://example.com/update?ip=192.0.2.1', {
 			headers: {
 				Authorization: 'Basic ' + btoa('email@example.com:validtoken'),
@@ -129,6 +132,18 @@ describe('UniFi DDNS Worker', () => {
 		});
 		expect(response.status).toBe(422);
 		expect(await response.text()).toBe("Missing 'hostname' parameter.");
+	});
+
+	it('responds with 422 when hostname parameter is empty', async () => {
+		mockVerify.mockResolvedValueOnce({ status: 'active' });
+
+		const response = await SELF.fetch('http://example.com/update?ip=192.0.2.1&hostnames=,', {
+			headers: {
+				Authorization: 'Basic ' + btoa('email@example.com:validtoken'),
+			},
+		});
+		expect(response.status).toBe(422);
+		expect(await response.text()).toBe('No hostnames provided.');
 	});
 
 	it('responds with 200 on valid update', async () => {
@@ -160,20 +175,6 @@ describe('UniFi DDNS Worker', () => {
 		expect(response.status).toBe(200);
 	});
 
-	it('responds with 400 when multiple zones are found', async () => {
-		mockVerify.mockResolvedValueOnce({ status: 'active' });
-		mockListZones.mockResolvedValueOnce({ result: [{ id: 'zone-id1' }, { id: 'zone-id2' }] });
-
-		const response = await SELF.fetch('http://example.com/update?ip=192.0.2.1&hostname=home.example.com', {
-			headers: {
-				Authorization: 'Basic ' + btoa('email@example.com:validtoken'),
-			},
-		});
-
-		expect(response.status).toBe(400);
-		expect(await response.text()).toBe('Multiple zones found; API Token must be scoped to a single zone.');
-	});
-
 	it('responds with 400 when no zones are found', async () => {
 		mockVerify.mockResolvedValueOnce({ status: 'active' });
 		mockListZones.mockResolvedValueOnce({ result: [] });
@@ -185,7 +186,7 @@ describe('UniFi DDNS Worker', () => {
 		});
 
 		expect(response.status).toBe(400);
-		expect(await response.text()).toBe('No zones found; API Token must be scoped to a single zone.');
+		expect(await response.text()).toBe('No zones available in API Token.');
 	});
 
 	it('responds with 400 when multiple records are found', async () => {
@@ -193,19 +194,19 @@ describe('UniFi DDNS Worker', () => {
 		mockListZones.mockResolvedValueOnce({ result: [{ id: 'zone-id' }] });
 		mockListRecords.mockResolvedValueOnce({
 			result: [
-				{ id: 'record-id1', name: 'home.example.com', type: 'A' },
-				{ id: 'record-id2', name: 'home.example.com', type: 'A' },
+				{ id: 'record-id1', name: 'home', type: 'A' },
+				{ id: 'record-id2', name: 'home', type: 'A' },
 			],
 		});
 
-		const response = await SELF.fetch('http://example.com/update?ip=192.0.2.1&hostname=home.example.com', {
+		const response = await SELF.fetch('http://example.com/update?ip=192.0.2.1&hostname=home', {
 			headers: {
 				Authorization: 'Basic ' + btoa('email@example.com:validtoken'),
 			},
 		});
 
 		expect(response.status).toBe(400);
-		expect(await response.text()).toBe('Multiple matching records found for home.example.com.');
+		expect(await response.text()).toBe("Multiple matching records found for 'home'. Specify a unique hostname per zone.");
 	});
 
 	it('responds with 400 when no records are found', async () => {
@@ -220,7 +221,7 @@ describe('UniFi DDNS Worker', () => {
 		});
 
 		expect(response.status).toBe(400);
-		expect(await response.text()).toBe('No matching record found for home.example.com. Create it manually first.');
+		expect(await response.text()).toBe("No matching record found for 'home.example.com'. Create it manually first.");
 	});
 
 	it('responds with 500 for an unforeseen internal server error', async () => {
@@ -269,24 +270,6 @@ describe('UniFi DDNS Worker', () => {
 		expect(mockListRecords).toHaveBeenCalledTimes(2);
 		expect(mockUpdateRecord).toHaveBeenCalledTimes(2);
 	});
-
-	it('responds with 500 when NTFY_URL is missing from env', async () => {
-		mockVerify.mockResolvedValueOnce({ status: 'active' });
-		mockListZones.mockResolvedValueOnce({ result: [{ id: 'zone-id' }] });
-		mockListRecords.mockResolvedValueOnce({ result: [{ id: 'record-id', name: 'home.example.com', type: 'A' }] });
-		mockUpdateRecord.mockResolvedValueOnce({});
-
-		const envWithoutNtfy = {};
-
-		const response = await SELF.fetch('http://example.com/update?ip=192.0.2.1&hostname=home.example.com', {
-			headers: {
-				Authorization: 'Basic ' + btoa('email@example.com:validtoken'),
-			},
-			bindings: envWithoutNtfy,
-		} as any);
-
-		expect(response.status).toBe(500);
-	});
 });
 
 describe('pushNtfy', () => {
@@ -300,10 +283,9 @@ describe('pushNtfy', () => {
 		fetchSpy.mockRestore();
 	});
 
-	it('does nothing if NTFY_URL is not provided', async () => {
+	it('throws error when NTFY_URL is missing', async () => {
 		const env = {} as unknown as Env;
-		await pushNtfy('Test message', env);
-		expect(fetchSpy).not.toHaveBeenCalled();
+		await expect(pushNtfy('Test message', env)).rejects.toThrow('NTFY_URL missing from env');
 	});
 
 	it('calls fetch with correct params when NTFY_URL is provided', async () => {

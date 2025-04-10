@@ -1,6 +1,6 @@
 export async function pushNtfy(message: string, env: Env): Promise<void> {
 	if (!env.NTFY_URL) {
-		return;
+		throw new Error('NTFY_URL missing from env');
 	}
 	try {
 		await fetch(env.NTFY_URL, {

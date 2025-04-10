@@ -78,50 +78,49 @@ async function updateHostnames(clientOptions: ClientOptions, newRecords: Address
 	// Verify API token status
 	const { status: tokenStatus } = await cloudflare.user.tokens.verify();
 	if (tokenStatus !== 'active') {
-		throw new HttpError(401, `API Token status: ${tokenStatus}`);
+		throw new HttpError(401, `API Token status: '${tokenStatus}'`);
 	}
 
 	// Expect exactly one zone
 	const { result: zones } = await cloudflare.zones.list();
-	if (zones.length !== 1) {
-		throw new HttpError(
-			400,
-			zones.length > 1
-				? 'Multiple zones found; API Token must be scoped to a single zone.'
-				: 'No zones found; API Token must be scoped to a single zone.',
-		);
+	if (zones.length === 0) {
+		throw new HttpError(400, 'No zones available in API Token.');
 	}
-	const zone = zones[0];
 
 	for (const newRecord of newRecords) {
 		// Retrieve matching DNS record
-		const { result: records } = await cloudflare.dns.records.list({
-			zone_id: zone.id,
-			name: newRecord.name as Cloudflare.DNS.Records.RecordListParams.Name,
-			type: newRecord.type,
-		});
-		if (records.length !== 1 || !records[0].id) {
-			throw new HttpError(
-				400,
-				records.length === 0
-					? `No matching record found for ${newRecord.name}. Create it manually first.`
-					: `Multiple matching records found for ${newRecord.name}.`,
+		let matches: { record: AddressableRecord & { id: string }; zoneId: string }[] = [];
+		for (const zone of zones) {
+			const { result: records } = await cloudflare.dns.records.list({
+				zone_id: zone.id,
+				name: newRecord.name as Cloudflare.DNS.Records.RecordListParams.Name,
+				type: newRecord.type,
+			});
+			matches.push(
+				...records.filter((rec) => rec.id).map((rec) => ({ record: rec as AddressableRecord & { id: string }, zoneId: zone.id })),
 			);
 		}
 
+		if (matches.length === 0) {
+			throw new HttpError(400, `No matching record found for '${newRecord.name}'. Create it manually first.`);
+		}
+		if (matches.length > 1) {
+			throw new HttpError(400, `Multiple matching records found for '${newRecord.name}'. Specify a unique hostname per zone.`);
+		}
+
 		// Update the DNS record
-		const existingRecord = records[0] as { id: string } & AddressableRecord;
-		const { proxied = false, comment } = existingRecord;
-		await cloudflare.dns.records.update(existingRecord.id, {
+		const { record, zoneId } = matches[0];
+		const { proxied = false, comment } = record;
+		await cloudflare.dns.records.update(record.id, {
 			content: newRecord.content,
-			zone_id: zone.id,
+			zone_id: zoneId,
 			name: newRecord.name,
 			type: newRecord.type,
 			proxied,
 			comment,
 		});
 
-		const successMsg = `DNS record for ${newRecord.name} (${newRecord.type}) updated to ${newRecord.content}`;
+		const successMsg = `DNS record for '${newRecord.name}' ('${newRecord.type}') updated to '${newRecord.content}'`;
 		console.log(successMsg);
 		await pushNtfy(successMsg, env);
 	}
