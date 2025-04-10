@@ -6,9 +6,6 @@ compatibility_flags = ["nodejs_compat"]
 
 routes = [{ pattern = "ddns.quist.network", custom_domain = true }]
 
-[vars]
-NTFY_URL = "https://ntfy.sh/kdblt_ddns"
-
 # Workers Logs
 # Docs: https://developers.cloudflare.com/workers/observability/logs/workers-logs/
 # Configuration: https://developers.cloudflare.com/workers/observability/logs/workers-logs/#enable-workers-logs
