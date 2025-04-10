@@ -1,150 +1,154 @@
 import { ClientOptions, Cloudflare } from 'cloudflare';
-import { AAAARecord, ARecord } from 'cloudflare/src/resources/dns/records.js';
-type AddressableRecord = AAAARecord | ARecord;
+import { ARecord, AAAARecord } from 'cloudflare/src/resources/dns/records.js';
+import { pushNtfy } from './pushNtfy';
 
-class HttpError extends Error {
+type AddressableRecord = ARecord | AAAARecord;
+
+export class HttpError extends Error {
 	constructor(
-		public statusCode: number,
+		public readonly statusCode: number,
 		message: string,
 	) {
 		super(message);
-		this.name = 'HttpError';
+		this.name = new.target.name;
+		Object.setPrototypeOf(this, new.target.prototype);
 	}
 }
 
 function constructClientOptions(request: Request): ClientOptions {
-	const authorization = request.headers.get('Authorization');
-	if (!authorization) {
-		throw new HttpError(401, 'API token missing.');
+	const authHeader = request.headers.get('Authorization');
+	if (!authHeader) {
+		throw new HttpError(401, 'API Token missing.');
 	}
 
-	const [, data] = authorization.split(' ');
-	const decoded = atob(data);
-	const index = decoded.indexOf(':');
+	const [_, token] = authHeader.split(' ');
+	if (!token) {
+		throw new HttpError(401, 'Invalid API Token.');
+	}
 
-	if (index === -1 || /[\0-\x1F\x7F]/.test(decoded)) {
-		throw new HttpError(401, 'Invalid API key or token.');
+	const decoded = atob(token);
+	const delimiterIndex = decoded.indexOf(':');
+	if (delimiterIndex === -1 || /[\0-\x1F\x7F]/.test(decoded)) {
+		throw new HttpError(401, 'Invalid API Token.');
 	}
 
 	return {
-		apiEmail: decoded.substring(0, index),
-		apiToken: decoded.substring(index + 1),
+		apiEmail: decoded.slice(0, delimiterIndex),
+		apiToken: decoded.slice(delimiterIndex + 1),
 	};
 }
 
-function constructDNSRecord(request: Request): AddressableRecord {
-	const url = new URL(request.url);
-	const params = url.searchParams;
-	let ip = params.get('ip') || params.get('myip');
-	const hostname = params.get('hostname');
+function constructDNSRecord(request: Request): AddressableRecord[] {
+	const { searchParams } = new URL(request.url);
+	let ip = searchParams.get('ip') || searchParams.get('myip');
+	const hostnameParam = searchParams.get('hostnames') || searchParams.get('hostname');
 
-	if (ip === null || ip === undefined) {
-		throw new HttpError(422, 'The "ip" parameter is required and cannot be empty. Specify ip=auto to use the client IP.');
-	} else if (ip == 'auto') {
+	if (!ip) {
+		throw new HttpError(422, "Missing 'ip' parameter. Use ip=auto to use the client IP.");
+	} else if (ip === 'auto') {
 		ip = request.headers.get('CF-Connecting-IP');
-		if (ip === null) {
-			throw new HttpError(500, 'Request asked for ip=auto but client IP address cannot be determined.');
+		if (!ip) {
+			throw new HttpError(500, 'ip=auto specified but client IP could not be determined.');
 		}
 	}
 
-	if (hostname === null || hostname === undefined) {
-		throw new HttpError(422, 'The "hostname" parameter is required and cannot be empty.');
+	if (!hostnameParam) {
+		throw new HttpError(422, "Missing 'hostname' parameter.");
+	}
+	const hostnames = hostnameParam
+		.split(',')
+		.map((s) => s.trim())
+		.filter(Boolean);
+	if (hostnames.length === 0) {
+		throw new HttpError(422, 'No hostnames provided.');
 	}
 
-	return {
+	// For each hostname, create the corresponding DNS record object.
+	return hostnames.map((hostname) => ({
 		content: ip,
 		name: hostname,
 		type: ip.includes('.') ? 'A' : 'AAAA',
 		ttl: 1,
-	};
+	}));
 }
 
-async function pushNtfy(message: string, env: Env): Promise<void> {
-	if (!env.NTFY_URL) return;
-	try {
-		await fetch(env.NTFY_URL, {
-			method: 'POST',
-			body: message,
-			headers: { 'Content-Type': 'text/plain' },
-		});
-	} catch (e) {
-		console.error('Failed to send ntfy update:', e);
-	}
-}
-
-async function update(clientOptions: ClientOptions, newRecord: AddressableRecord, env: Env): Promise<Response> {
+async function updateHostnames(clientOptions: ClientOptions, newRecords: AddressableRecord[], env: Env): Promise<Response> {
 	const cloudflare = new Cloudflare(clientOptions);
 
-	const tokenStatus = (await cloudflare.user.tokens.verify()).status;
+	// Verify API token status
+	const { status: tokenStatus } = await cloudflare.user.tokens.verify();
 	if (tokenStatus !== 'active') {
-		throw new HttpError(401, 'This API Token is ' + tokenStatus);
+		throw new HttpError(401, `API Token status: ${tokenStatus}`);
 	}
 
-	const zones = (await cloudflare.zones.list()).result;
-	if (zones.length > 1) {
-		throw new HttpError(400, 'More than one zone was found! You must supply an API Token scoped to a single zone.');
-	} else if (zones.length === 0) {
-		throw new HttpError(400, 'No zones found! You must supply an API Token scoped to a single zone.');
+	// Expect exactly one zone
+	const { result: zones } = await cloudflare.zones.list();
+	if (zones.length !== 1) {
+		throw new HttpError(
+			400,
+			zones.length > 1
+				? 'Multiple zones found; API Token must be scoped to a single zone.'
+				: 'No zones found; API Token must be scoped to a single zone.',
+		);
 	}
-
 	const zone = zones[0];
 
-	const records = (
-		await cloudflare.dns.records.list({
+	for (const newRecord of newRecords) {
+		// Retrieve matching DNS record
+		const { result: records } = await cloudflare.dns.records.list({
 			zone_id: zone.id,
-			name: newRecord.name as any,
+			name: newRecord.name as Cloudflare.DNS.Records.RecordListParams.Name,
 			type: newRecord.type,
-		})
-	).result;
+		});
+		if (records.length !== 1 || !records[0].id) {
+			throw new HttpError(
+				400,
+				records.length === 0
+					? `No matching record found for ${newRecord.name}. Create it manually first.`
+					: `Multiple matching records found for ${newRecord.name}.`,
+			);
+		}
 
-	if (records.length > 1) {
-		throw new HttpError(400, 'More than one matching record found!');
-	} else if (records.length === 0 || records[0].id === undefined) {
-		throw new HttpError(400, 'No record found! You must first manually create the record.');
+		// Update the DNS record
+		const existingRecord = records[0] as { id: string } & AddressableRecord;
+		const { proxied = false, comment } = existingRecord;
+		await cloudflare.dns.records.update(existingRecord.id, {
+			content: newRecord.content,
+			zone_id: zone.id,
+			name: newRecord.name,
+			type: newRecord.type,
+			proxied,
+			comment,
+		});
+
+		const successMsg = `DNS record for ${newRecord.name} (${newRecord.type}) updated to ${newRecord.content}`;
+		console.log(successMsg);
+		await pushNtfy(successMsg, env);
 	}
-
-	// Extract current properties
-	const currentRecord = records[0] as AddressableRecord;
-	const proxied = currentRecord.proxied ?? false; // Default to `false` if `proxied` is undefined
-	const comment = currentRecord.comment;
-
-	await cloudflare.dns.records.update(records[0].id, {
-		content: newRecord.content,
-		zone_id: zone.id,
-		name: newRecord.name as any,
-		type: newRecord.type,
-		proxied, // Pass the existing "proxied" status
-		comment, // Pass the existing "comment"
-	});
-
-	const successMsg = `DNS record for ${newRecord.name} (${newRecord.type}) updated successfully to ${newRecord.content}`;
-	console.log(successMsg);
-	await pushNtfy(successMsg, env);
 
 	return new Response('OK', { status: 200 });
 }
 
 export default {
 	async fetch(request: Request, env: Env): Promise<Response> {
-		console.log('Requester IP: ' + request.headers.get('CF-Connecting-IP'));
-		console.log(request.method + ': ' + request.url);
-		console.log('Body: ' + (await request.text()));
+		const logDetails = {
+			ip: request.headers.get('CF-Connecting-IP'),
+			method: request.method,
+			url: request.url,
+			body: await request.text(),
+		};
+		console.log('Incoming request:', logDetails);
 
 		try {
-			// Construct client options and DNS record
 			const clientOptions = constructClientOptions(request);
 			const record = constructDNSRecord(request);
-
-			// Run the update function
-			return await update(clientOptions, record, env);
-		} catch (error) {
-			if (error instanceof HttpError) {
-				console.log('Error updating DNS record: ' + error.message);
-				return new Response(error.message, { status: error.statusCode });
-			} else {
-				console.log('Error updating DNS record: ' + error);
-				return new Response('Internal Server Error', { status: 500 });
-			}
+			return await updateHostnames(clientOptions, record, env);
+		} catch (err: unknown) {
+			const isHttpError = err instanceof HttpError;
+			const message = isHttpError ? err.message : 'Internal Server Error';
+			const statusCode = isHttpError ? err.statusCode : 500;
+			console.error(`Error updating DNS record: ${message}`);
+			return new Response(message, { status: statusCode });
 		}
 	},
 } satisfies ExportedHandler<Env>;
