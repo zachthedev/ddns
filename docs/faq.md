@@ -1,12 +1,13 @@
 # Frequently Asked Questions
 
-This FAQ addresses common issues and solutions for configuring UniFi devices to update Cloudflare DNS records using DDNS, based on discussions from [issues](https://github.com/willswire/unifi-ddns/issues/) and [discussions](https://github.com/willswire/unifi-ddns/discussions).
+This FAQ addresses common issues and solutions for configuring UniFi devices to update Cloudflare DNS records using DDNS, based on discussions from [issues](https://github.com/zachthedev/ddns/issues/) and [discussions](https://github.com/zachthedev/ddns/discussions).
 
 ## 1. What is the correct server configuration for UniFi devices when using Cloudflare DDNS?
 
 The server configuration depends on your UniFi device model:
 
 - **Older Gateways (e.g., USG, USG Pro):**
+
   - **Server:** `unifi-cloudflare-ddns.<your_worker_subdomain>.workers.dev`
   - **Note:** Do **not** include the path with variables.
 
@@ -19,9 +20,11 @@ This distinction is crucial to ensure the DDNS updates function correctly.
 ## 2. How do I configure DDNS on my UniFi device?
 
 1. **Access UniFi Controller:**
+
    - Navigate to **Settings** > **Internet** > **WAN** > **Dynamic DNS**.
 
 2. **Create New Dynamic DNS Entry:**
+
    - **Service:** Select `custom`.
    - **Hostname:** Enter your desired hostname (e.g., `subdomain.example.com`).
    - **Username:** Enter your Cloudflare account email.
@@ -49,9 +52,11 @@ Double-check your device model and adjust the server configuration accordingly.
 For **UDM-Pro** devices:
 
 1. **SSH into your UDM-Pro:**
+
    - Use an SSH client to access your device.
 
 2. **Run the following command:**
+
    ```bash
    ps aux | grep inadyn
    inadyn -n -1 --force -f /run/ddns-eth4-inadyn.conf
@@ -63,9 +68,11 @@ For **UDM-Pro** devices:
 For **USG** devices:
 
 1. **SSH into your USG:**
+
    - Use an SSH client to access your device.
 
 2. **Run the following command:**
+
    ```bash
    sudo ddclient -daemon=0 -verbose -noquiet -debug -file /etc/ddclient/ddclient_eth0.conf
    ```
@@ -110,9 +117,11 @@ To support scenarios where such a router needs to be externally available (e.g. 
 ## 12. What should I do if I continue to experience issues with DDNS updates?
 
 - **Verify Configuration:**
+
   - Double-check all entries in your DDNS settings for accuracy.
 
 - **Check Logs:**
+
   - Review system logs on your UniFi device for error messages.
 
 - **Seek Community Assistance:**
