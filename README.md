@@ -11,6 +11,7 @@ A Cloudflare Worker script that enables UniFi devices (e.g., UDM-Pro, USG) to dy
 
 This is a fork from [willswire](https://github.com/willswire/unifi-ddns). The changes are as follows
 
+- Connect with [ntfy](https://ntfy.sh) to get alerted when WAN IP changes
 - Allows multiple zones on the API Token
 - Allows a comma-separated list of hostnames using param `hostnames`
 
