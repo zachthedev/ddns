@@ -3,6 +3,7 @@
 	"version": "3.1.1",
 	"private": true,
 	"scripts": {
+		"deploy": "wrangler deploy",
 		"dev": "wrangler dev",
 		"start": "wrangler dev",
 		"test": "vitest",
@@ -11,6 +12,7 @@
 	},
 	"devDependencies": {
 		"@cloudflare/vitest-pool-workers": "0.8.12",
+		"@cloudflare/workers-types": "4.20250407.0",
 		"@vitest/coverage-istanbul": "3.0.7",
 		"typescript": "5.8.2",
 		"vitest": "3.0.7",

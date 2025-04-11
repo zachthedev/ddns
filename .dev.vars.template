@@ -1,0 +1,3 @@
+# Create a secret on your worker.
+# Command: npx wrangler secret put NTFY_URL
+NTFY_URL=""
