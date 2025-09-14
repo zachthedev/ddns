@@ -152,10 +152,8 @@ async function updateHostnames(clientOptions: ClientOptions, newRecords: Address
 		// Continue even if KV storage fails
 	}
 
-	// Send grouped notification if there are any updates
-	if (updateMessages.length > 0) {
-		await pushNtfy(updateMessages, env);
-	}
+	// Send grouped notification for all updates
+	await pushNtfy(updateMessages, env);
 
 	return new Response('OK', { status: 200 });
 }
