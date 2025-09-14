@@ -436,6 +436,48 @@ describe('UniFi DDNS Worker', () => {
 			headers: { 'Content-Type': 'text/plain' },
 		});
 	});
+
+	it('handles KV read failure gracefully and continues with update', async () => {
+		const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+		mockVerify.mockResolvedValueOnce({ status: 'active' });
+		mockListZones.mockResolvedValueOnce({ result: [{ id: 'zone-id' }] });
+		mockListRecords.mockResolvedValueOnce({ result: [{ id: 'record-id', name: 'home.example.com', type: 'A' }] });
+		mockUpdateRecord.mockResolvedValueOnce({});
+		mockKV.get.mockRejectedValueOnce(new Error('KV read error')); // Simulate KV read failure
+
+		const request = new Request('http://example.com/update?ip=192.0.2.1&hostname=home.example.com', {
+			headers: {
+				Authorization: 'Basic ' + btoa('email@example.com:validtoken'),
+			},
+		});
+		const response = await worker.fetch(request, env);
+
+		expect(response.status).toBe(200);
+		expect(consoleSpy).toHaveBeenCalledWith('Failed to get last known IP from KV:', new Error('KV read error'));
+		expect(mockKV.put).toHaveBeenCalledWith('last_ip', '192.0.2.1');
+		consoleSpy.mockRestore();
+	});
+
+	it('handles KV write failure gracefully and continues with response', async () => {
+		const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+		mockVerify.mockResolvedValueOnce({ status: 'active' });
+		mockListZones.mockResolvedValueOnce({ result: [{ id: 'zone-id' }] });
+		mockListRecords.mockResolvedValueOnce({ result: [{ id: 'record-id', name: 'home.example.com', type: 'A' }] });
+		mockUpdateRecord.mockResolvedValueOnce({});
+		mockKV.get.mockResolvedValueOnce('192.0.2.2'); // Different IP to trigger update
+		mockKV.put.mockRejectedValueOnce(new Error('KV write error')); // Simulate KV write failure
+
+		const request = new Request('http://example.com/update?ip=192.0.2.1&hostname=home.example.com', {
+			headers: {
+				Authorization: 'Basic ' + btoa('email@example.com:validtoken'),
+			},
+		});
+		const response = await worker.fetch(request, env);
+
+		expect(response.status).toBe(200);
+		expect(consoleSpy).toHaveBeenCalledWith('Failed to store last known IP to KV:', new Error('KV write error'));
+		consoleSpy.mockRestore();
+	});
 });
 
 describe('pushNtfy', () => {
