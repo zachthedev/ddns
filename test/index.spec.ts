@@ -9,6 +9,15 @@ const mockListZones = vi.fn();
 const mockListRecords = vi.fn();
 const mockUpdateRecord = vi.fn();
 
+// Mock KV namespace
+const mockKV = {
+	get: vi.fn(),
+	put: vi.fn(),
+	list: vi.fn(),
+	delete: vi.fn(),
+	getWithMetadata: vi.fn(),
+};
+
 vi.mock('cloudflare', () => {
 	return {
 		Cloudflare: vi.fn().mockImplementation(() => ({
@@ -35,6 +44,7 @@ describe('UniFi DDNS Worker', () => {
 
 	const env: Env = {
 		NTFY_URL: 'https://ntfy.sh/example',
+		DDNS_KV: mockKV as unknown as KVNamespace,
 	};
 
 	beforeAll(() => {
@@ -46,6 +56,9 @@ describe('UniFi DDNS Worker', () => {
 		vi.clearAllMocks();
 		// All calls to fetch—including those inside pushNtfy—are intercepted.
 		global.fetch = vi.fn().mockResolvedValue(new Response('OK'));
+		// Reset KV mock methods
+		mockKV.get.mockResolvedValue(null);
+		mockKV.put.mockResolvedValue(undefined);
 	});
 
 	afterAll(() => {
@@ -173,6 +186,7 @@ describe('UniFi DDNS Worker', () => {
 		mockListZones.mockResolvedValueOnce({ result: [{ id: 'zone-id' }] });
 		mockListRecords.mockResolvedValueOnce({ result: [{ id: 'record-id', name: 'home.example.com', type: 'A' }] });
 		mockUpdateRecord.mockResolvedValueOnce({});
+		mockKV.get.mockResolvedValueOnce(null); // No stored IP (first run)
 
 		const request = new Request('http://example.com/update?ip=192.0.2.1&hostname=home.example.com', {
 			headers: {
@@ -182,6 +196,7 @@ describe('UniFi DDNS Worker', () => {
 		const response = await worker.fetch(request, env);
 
 		expect(response.status).toBe(200);
+		expect(mockKV.put).toHaveBeenCalledWith('last_ip', '192.0.2.1');
 	});
 
 	it('responds with 200 on valid update when IP is set to auto', async () => {
@@ -189,6 +204,7 @@ describe('UniFi DDNS Worker', () => {
 		mockListZones.mockResolvedValueOnce({ result: [{ id: 'zone-id' }] });
 		mockListRecords.mockResolvedValueOnce({ result: [{ id: 'record-id', name: 'home.example.com', type: 'A' }] });
 		mockUpdateRecord.mockResolvedValueOnce({});
+		mockKV.get.mockResolvedValueOnce(null); // No stored IP (first run)
 
 		const request = new Request('http://example.com/update?ip=auto&hostname=home.example.com', {
 			headers: {
@@ -199,6 +215,7 @@ describe('UniFi DDNS Worker', () => {
 		const response = await worker.fetch(request, env);
 
 		expect(response.status).toBe(200);
+		expect(mockKV.put).toHaveBeenCalledWith('last_ip', '192.0.2.1');
 	});
 
 	it('responds with 400 when no zones are found', async () => {
@@ -274,6 +291,7 @@ describe('UniFi DDNS Worker', () => {
 		mockListZones.mockResolvedValueOnce({ result: [{ id: 'zone-id' }] });
 		mockListRecords.mockResolvedValueOnce({ result: [{ id: 'record-id', name: 'home.example.com', type: 'AAAA' }] });
 		mockUpdateRecord.mockResolvedValueOnce({});
+		mockKV.get.mockResolvedValueOnce(null); // No stored IP (first run)
 
 		const request = new Request('http://example.com/update?ip=2001:0db8:85a3:0000:0000:8a2e:0370:7334&hostname=home.example.com', {
 			headers: {
@@ -283,6 +301,7 @@ describe('UniFi DDNS Worker', () => {
 		const response = await worker.fetch(request, env);
 
 		expect(response.status).toBe(200);
+		expect(mockKV.put).toHaveBeenCalledWith('last_ip', '2001:0db8:85a3:0000:0000:8a2e:0370:7334');
 	});
 
 	it('responds with 200 on valid update for comma separated hostnames', async () => {
@@ -303,6 +322,103 @@ describe('UniFi DDNS Worker', () => {
 		expect(response.status).toBe(200);
 		expect(mockListRecords).toHaveBeenCalledTimes(2);
 		expect(mockUpdateRecord).toHaveBeenCalledTimes(2);
+		expect(mockKV.put).toHaveBeenCalledWith('last_ip', '192.0.2.1');
+	});
+
+	it('skips update and notification when IP has not changed', async () => {
+		mockVerify.mockResolvedValueOnce({ status: 'active' });
+		mockKV.get.mockResolvedValueOnce('192.0.2.1'); // Same IP as request
+
+		const request = new Request('http://example.com/update?ip=192.0.2.1&hostname=home.example.com', {
+			headers: {
+				Authorization: 'Basic ' + btoa('email@example.com:validtoken'),
+			},
+		});
+		const response = await worker.fetch(request, env);
+
+		expect(response.status).toBe(200);
+		expect(await response.text()).toBe('OK - No IP change detected');
+		expect(mockListZones).not.toHaveBeenCalled();
+		expect(mockListRecords).not.toHaveBeenCalled();
+		expect(mockUpdateRecord).not.toHaveBeenCalled();
+		expect(mockKV.put).not.toHaveBeenCalled();
+		expect(global.fetch).not.toHaveBeenCalled(); // No ntfy notification should be sent
+	});
+
+	it('sends grouped notification for multiple hostname updates', async () => {
+		mockVerify.mockResolvedValueOnce({ status: 'active' });
+		// Add KV mock to return different IP than request IP to trigger update
+		mockKV.get.mockResolvedValueOnce('10.0.0.1'); // Different from 192.0.2.1 in request 
+		mockListZones.mockResolvedValueOnce({ result: [{ id: 'zone-id' }] });
+		mockListRecords
+			.mockResolvedValueOnce({ result: [{ id: 'record-id1', name: 'home.example.com', type: 'A' }] })
+			.mockResolvedValueOnce({ result: [{ id: 'record-id2', name: 'office.example.com', type: 'A' }] });
+		mockUpdateRecord.mockResolvedValueOnce({}).mockResolvedValueOnce({});
+
+		const request = new Request('http://example.com/update?ip=192.0.2.1&hostname=home.example.com,office.example.com', {
+			headers: {
+				Authorization: 'Basic ' + btoa('email@example.com:validtoken'),
+			},
+		});
+		const response = await worker.fetch(request, env);
+
+		expect(response.status).toBe(200);
+		expect(mockListRecords).toHaveBeenCalledTimes(2);
+		expect(mockUpdateRecord).toHaveBeenCalledTimes(2);
+		expect(mockKV.put).toHaveBeenCalledWith('last_ip', '192.0.2.1');
+		
+		// Verify that ntfy was called with grouped message
+		expect(global.fetch).toHaveBeenCalledWith('https://ntfy.sh/example', {
+			method: 'POST',
+			body: `DNS Records Updated:\n• DNS record for 'home.example.com' ('A') updated to '192.0.2.1'\n• DNS record for 'office.example.com' ('A') updated to '192.0.2.1'`,
+			headers: { 'Content-Type': 'text/plain' },
+		});
+	});
+
+	it('updates IP and sends notification when IP changes', async () => {
+		mockVerify.mockResolvedValueOnce({ status: 'active' });
+		mockListZones.mockResolvedValueOnce({ result: [{ id: 'zone-id' }] });
+		mockListRecords.mockResolvedValueOnce({ result: [{ id: 'record-id', name: 'home.example.com', type: 'A' }] });
+		mockUpdateRecord.mockResolvedValueOnce({});
+		mockKV.get.mockResolvedValueOnce('192.0.2.2'); // Different IP to trigger update
+
+		const request = new Request('http://example.com/update?ip=192.0.2.1&hostname=home.example.com', {
+			headers: {
+				Authorization: 'Basic ' + btoa('email@example.com:validtoken'),
+			},
+		});
+		const response = await worker.fetch(request, env);
+
+		expect(response.status).toBe(200);
+		expect(mockKV.put).toHaveBeenCalledWith('last_ip', '192.0.2.1');
+		expect(global.fetch).toHaveBeenCalledWith('https://ntfy.sh/example', {
+			method: 'POST',
+			body: "DNS record for 'home.example.com' ('A') updated to '192.0.2.1'",
+			headers: { 'Content-Type': 'text/plain' },
+		});
+	});
+
+	it('handles first run with no stored IP', async () => {
+		mockVerify.mockResolvedValueOnce({ status: 'active' });
+		mockListZones.mockResolvedValueOnce({ result: [{ id: 'zone-id' }] });
+		mockListRecords.mockResolvedValueOnce({ result: [{ id: 'record-id', name: 'home.example.com', type: 'A' }] });
+		mockUpdateRecord.mockResolvedValueOnce({});
+		mockKV.get.mockResolvedValueOnce(null); // No stored IP (first run)
+
+		const request = new Request('http://example.com/update?ip=192.0.2.1&hostname=home.example.com', {
+			headers: {
+				Authorization: 'Basic ' + btoa('email@example.com:validtoken'),
+			},
+		});
+		const response = await worker.fetch(request, env);
+
+		expect(response.status).toBe(200);
+		expect(mockKV.put).toHaveBeenCalledWith('last_ip', '192.0.2.1');
+		expect(global.fetch).toHaveBeenCalledWith('https://ntfy.sh/example', {
+			method: 'POST',
+			body: "DNS record for 'home.example.com' ('A') updated to '192.0.2.1'",
+			headers: { 'Content-Type': 'text/plain' },
+		});
 	});
 });
 
@@ -345,5 +461,36 @@ describe('pushNtfy', () => {
 		await pushNtfy('Error test', env);
 		expect(consoleSpy).toHaveBeenCalledWith('Failed to send ntfy push: ', testError);
 		consoleSpy.mockRestore();
+	});
+
+	it('handles array of messages and groups them', async () => {
+		const env = { NTFY_URL: 'https://ntfy.sh/example' } as unknown as Env;
+		const messages = [
+			"DNS record for 'home.example.com' ('A') updated to '192.0.2.1'",
+			"DNS record for 'office.example.com' ('A') updated to '192.0.2.1'",
+		];
+		await pushNtfy(messages, env);
+		expect(fetchSpy).toHaveBeenCalledWith(env.NTFY_URL, {
+			method: 'POST',
+			body: `DNS Records Updated:\n• DNS record for 'home.example.com' ('A') updated to '192.0.2.1'\n• DNS record for 'office.example.com' ('A') updated to '192.0.2.1'`,
+			headers: { 'Content-Type': 'text/plain' },
+		});
+	});
+
+	it('handles single message array without grouping format', async () => {
+		const env = { NTFY_URL: 'https://ntfy.sh/example' } as unknown as Env;
+		const messages = ["DNS record for 'home.example.com' ('A') updated to '192.0.2.1'"];
+		await pushNtfy(messages, env);
+		expect(fetchSpy).toHaveBeenCalledWith(env.NTFY_URL, {
+			method: 'POST',
+			body: "DNS record for 'home.example.com' ('A') updated to '192.0.2.1'",
+			headers: { 'Content-Type': 'text/plain' },
+		});
+	});
+
+	it('handles empty array gracefully', async () => {
+		const env = { NTFY_URL: 'https://ntfy.sh/example' } as unknown as Env;
+		await pushNtfy([], env);
+		expect(fetchSpy).not.toHaveBeenCalled();
 	});
 });

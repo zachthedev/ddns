@@ -3,6 +3,7 @@
 declare namespace Cloudflare {
 	interface Env {
 		NTFY_URL: string;
+		DDNS_KV: KVNamespace;
 	}
 }
 interface Env extends Cloudflare.Env {}
