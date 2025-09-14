@@ -85,14 +85,16 @@ async function updateHostnames(clientOptions: ClientOptions, newRecords: Address
 	const currentIp = newRecords[0]?.content; // All records have the same IP
 	let lastKnownIp: string | null = null;
 	try {
-		lastKnownIp = await env.DDNS_KV.get('last_ip');
+		if (env.DDNS_KV) {
+			lastKnownIp = await env.DDNS_KV.get('last_ip');
+		}
 	} catch (error) {
 		console.error('Failed to get last known IP from KV:', error);
 		// Continue with the update if KV access fails
 	}
 	
 	const ipChanged = lastKnownIp !== currentIp;
-	if (!ipChanged) {
+	if (!ipChanged && env.DDNS_KV) {
 		console.log(`IP address ${currentIp} hasn't changed from last known value. Skipping DNS update and notification.`);
 		return new Response('OK. No IP change detected.', { status: 200 });
 	}
@@ -146,7 +148,9 @@ async function updateHostnames(clientOptions: ClientOptions, newRecords: Address
 
 	// Store the new IP address as the last known IP
 	try {
-		await env.DDNS_KV.put('last_ip', currentIp);
+		if (env.DDNS_KV) {
+			await env.DDNS_KV.put('last_ip', currentIp);
+		}
 	} catch (error) {
 		console.error('Failed to store last known IP to KV:', error);
 		// Continue even if KV storage fails
