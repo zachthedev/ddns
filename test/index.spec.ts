@@ -54,9 +54,18 @@ describe('UniFi DDNS Worker', () => {
 	beforeEach(() => {
 		// Clear all mocks before each test to prevent state leakage
 		vi.clearAllMocks();
+		
+		// Reset all Cloudflare API mocks to clean state
+		mockVerify.mockReset();
+		mockListZones.mockReset();
+		mockListRecords.mockReset();
+		mockUpdateRecord.mockReset();
+		mockKV.get.mockReset();
+		mockKV.put.mockReset();
+		
 		// All calls to fetch—including those inside pushNtfy—are intercepted.
 		global.fetch = vi.fn().mockResolvedValue(new Response('OK'));
-		// Reset KV mock methods
+		// Set default KV mock implementations
 		mockKV.get.mockResolvedValue(null);
 		mockKV.put.mockResolvedValue(undefined);
 	});
@@ -346,13 +355,6 @@ describe('UniFi DDNS Worker', () => {
 	});
 
 	it('sends grouped notification for multiple hostname updates', async () => {
-		// Reset mocks to ensure clean state for this test
-		mockVerify.mockReset();
-		mockKV.get.mockReset();
-		mockListZones.mockReset();
-		mockListRecords.mockReset();
-		mockUpdateRecord.mockReset();
-		
 		mockVerify.mockResolvedValueOnce({ status: 'active' });
 		// Add KV mock to return different IP than request IP to trigger update
 		mockKV.get.mockResolvedValueOnce('10.0.0.1'); // Different from 192.0.2.1 in request 
