@@ -346,6 +346,13 @@ describe('UniFi DDNS Worker', () => {
 	});
 
 	it('sends grouped notification for multiple hostname updates', async () => {
+		// Reset mocks to ensure clean state for this test
+		mockVerify.mockReset();
+		mockKV.get.mockReset();
+		mockListZones.mockReset();
+		mockListRecords.mockReset();
+		mockUpdateRecord.mockReset();
+		
 		mockVerify.mockResolvedValueOnce({ status: 'active' });
 		// Add KV mock to return different IP than request IP to trigger update
 		mockKV.get.mockResolvedValueOnce('10.0.0.1'); // Different from 192.0.2.1 in request 
