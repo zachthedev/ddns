@@ -63,6 +63,16 @@ UniFi devices do not natively support Cloudflare as a DDNS provider. This script
    - **Server:** `<worker-name>.<worker-subdomain>.workers.dev/update?ip=%i&hostname=%h`
      _(Omit `https://`)_
 
+## 🛠️ **Optional: Enable IP Change Detection**
+
+To reduce unnecessary DNS updates and notifications, you can enable IP change detection using Cloudflare Workers KV:
+
+- The worker will store your last known IP address
+- DNS updates only occur when your IP actually changes
+- Reduces API calls and notifications
+
+For setup instructions, see: [`/docs/kv-setup.md`](docs/kv-setup.md)
+
 ## 🛠️ **Testing & Troubleshooting**
 
 Using this script with various Ubiquiti devices and different UniFi software versions can introduce unique challenges. If you encounter issues, start by checking the FAQ in `/docs/faq.md`. If you don’t find a solution, you can ask a question on the [discussions page](https://github.com/zachthedev/ddns/discussions/new?category=q-a). If the problem persists, please raise an issue [here](https://github.com/zachthedev/ddns/issues).
