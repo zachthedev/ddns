@@ -337,7 +337,7 @@ describe('UniFi DDNS Worker', () => {
 		const response = await worker.fetch(request, env);
 
 		expect(response.status).toBe(200);
-		expect(await response.text()).toBe('OK - No IP change detected');
+		expect(await response.text()).toBe('OK. No IP change detected.');
 		expect(mockListZones).not.toHaveBeenCalled();
 		expect(mockListRecords).not.toHaveBeenCalled();
 		expect(mockUpdateRecord).not.toHaveBeenCalled();
@@ -350,10 +350,17 @@ describe('UniFi DDNS Worker', () => {
 		// Add KV mock to return different IP than request IP to trigger update
 		mockKV.get.mockResolvedValueOnce('10.0.0.1'); // Different from 192.0.2.1 in request 
 		mockListZones.mockResolvedValueOnce({ result: [{ id: 'zone-id' }] });
+		
+		// For multiple hostnames, mockListRecords will be called once per hostname
+		// First call: for home.example.com
+		// Second call: for office.example.com
 		mockListRecords
 			.mockResolvedValueOnce({ result: [{ id: 'record-id1', name: 'home.example.com', type: 'A' }] })
 			.mockResolvedValueOnce({ result: [{ id: 'record-id2', name: 'office.example.com', type: 'A' }] });
-		mockUpdateRecord.mockResolvedValueOnce({}).mockResolvedValueOnce({});
+		
+		mockUpdateRecord
+			.mockResolvedValueOnce({})
+			.mockResolvedValueOnce({});
 
 		const request = new Request('http://example.com/update?ip=192.0.2.1&hostname=home.example.com,office.example.com', {
 			headers: {

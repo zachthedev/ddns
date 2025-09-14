@@ -92,10 +92,9 @@ async function updateHostnames(clientOptions: ClientOptions, newRecords: Address
 	}
 	
 	const ipChanged = lastKnownIp !== currentIp;
-
 	if (!ipChanged) {
 		console.log(`IP address ${currentIp} hasn't changed from last known value. Skipping DNS update and notification.`);
-		return new Response('OK - No IP change detected', { status: 200 });
+		return new Response('OK. No IP change detected.', { status: 200 });
 	}
 
 	// Expect exactly one zone
