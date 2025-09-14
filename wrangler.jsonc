@@ -2,7 +2,7 @@
 	"$schema": "node_modules/wrangler/config-schema.json",
 	"name": "ddns",
 	"main": "src/index.ts",
-	"compatibility_date": "2024-12-18",
+	"compatibility_date": "2025-09-01",
 	"compatibility_flags": ["nodejs_compat"],
 
 	// KV Namespace for storing last known IP address
