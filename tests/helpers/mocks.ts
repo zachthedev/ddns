@@ -74,20 +74,30 @@ export const createAuthHeader = (email: string, token: string): string => {
 	return `Bearer ${credentials}`;
 };
 
-export const mockConsole = (): { restore: () => void } => {
-	const originalConsole = { ...console };
-
-	const restore = (): void => {
-		Object.assign(console, originalConsole);
-	};
-
-	console.log = vi.fn();
-
-	console.error = vi.fn();
-
-	console.warn = vi.fn();
-
-	console.info = vi.fn();
-
-	return { restore };
+/**
+ * Wires the standard single-zone / single-record happy-path mocks used by
+ * tests that exercise the post-auth update pipeline without customising the
+ * Cloudflare API responses.
+ *
+ * Zone id: 'zone123', record id: 'record123', hostname: 'test.example.com',
+ * current content: '192.168.1.1'.
+ */
+export const wireStandardHappyPath = (mockClient: ReturnType<typeof createMockCloudflareClient>): void => {
+	mockClient.user.tokens.verify.mockResolvedValue({ status: 'active' });
+	mockClient.zones.list.mockResolvedValue({
+		result: [{ id: 'zone123', name: 'example.com' }],
+	});
+	mockClient.dns.records.list.mockResolvedValue({
+		result: [
+			{
+				id: 'record123',
+				name: 'test.example.com',
+				type: 'A',
+				content: '192.168.1.1',
+				proxied: false,
+				ttl: 1,
+			},
+		],
+	});
+	mockClient.dns.records.update.mockResolvedValue(undefined);
 };

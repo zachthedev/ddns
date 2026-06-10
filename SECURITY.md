@@ -6,7 +6,7 @@ We actively support and provide security updates for the following versions of o
 
 | **Version** | **Supported**    |
 | ----------- | ---------------- |
-| **3.0.x**   | ✅ Supported     |
+| **3.x**     | ✅ Supported     |
 | **< 3.0**   | ❌ Not Supported |
 
 If you're using an unsupported version, we recommend upgrading to a supported version as soon as possible to ensure the security and stability of your system.

@@ -18,7 +18,15 @@ This is a fork from [willswire](https://github.com/willswire/unifi-ddns) with th
 
 ## Why Use This?
 
-UniFi Network Application 9.1.92+ ships native Cloudflare DDNS support. This worker remains useful for multi-hostname updates, preserving proxy status and TTL on existing records, change-only ntfy notifications, multi-zone tokens, and older firmware without native support.
+UniFi Network Application 9.1.92+ ships native Cloudflare DDNS support (Service: Cloudflare, with hostname, zone name, and API token). If all you need is one hostname following your WAN IP, use that.
+
+This worker exists for what the native client doesn't do:
+
+- **Push notifications** via [ntfy](https://ntfy.sh) when your IP actually changes
+- **Multi-hostname updates** in a single entry (comma-separated), including across multiple zones
+- **Record preservation**: proxy status, TTL, and comments on existing records survive updates
+- **`ip=auto`** for routers behind NAT that would otherwise report a private IP
+- **Audit history** of DNS changes for compliance
 
 ## 🚀 **Setup Overview**
 
