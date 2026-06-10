@@ -33,8 +33,11 @@ jobs:
       - name: TypeScript type checking
         run: bun run typecheck
 
+      # wrangler types includes secret names from .dev.vars; materialize it
+      # from the committed template so typegen is deterministic everywhere.
       - name: Check generated types are current
         run: |
+          cp .dev.vars.template .dev.vars
           bun run cf-typegen
           git diff --exit-code worker-configuration.d.ts
 
