@@ -7,24 +7,22 @@ This FAQ addresses common issues and solutions for configuring UniFi devices to 
 The server configuration depends on your UniFi device model:
 
 - **Older Gateways (e.g., USG, USG Pro):**
-
-  - **Server:** `unifi-cloudflare-ddns.<your_worker_subdomain>.workers.dev`
+  - **Server:** `<worker-name>.<worker-subdomain>.workers.dev`
   - **Note:** Do **not** include the path with variables.
 
 - **Newer Gateways (e.g., UDM series, UXG series):**
-  - **Server:** `unifi-cloudflare-ddns.<your_worker_subdomain>.workers.dev/update?ip=%i&hostname=%h`
-  - **Note:** Include the full path with variables.
+  - **Server:** `<worker-name>.<worker-subdomain>.workers.dev/update?ip=%i&hostname=%h`
+  - **Note:** Include the full path with variables. Multiple hostnames are
+    supported as a comma-separated list, e.g. `hostnames=example.com,*.example.com`.
 
 This distinction is crucial to ensure the DDNS updates function correctly.
 
 ## 2. How do I configure DDNS on my UniFi device?
 
 1. **Access UniFi Controller:**
-
    - Navigate to **Settings** > **Internet** > **WAN** > **Dynamic DNS**.
 
 2. **Create New Dynamic DNS Entry:**
-
    - **Service:** Select `custom`.
    - **Hostname:** Enter your desired hostname (e.g., `subdomain.example.com`).
    - **Username:** Enter your Cloudflare account email.
@@ -52,7 +50,6 @@ Double-check your device model and adjust the server configuration accordingly.
 For **UDM-Pro** devices:
 
 1. **SSH into your UDM-Pro:**
-
    - Use an SSH client to access your device.
 
 2. **Run the following command:**
@@ -68,7 +65,6 @@ For **UDM-Pro** devices:
 For **USG** devices:
 
 1. **SSH into your USG:**
-
    - Use an SSH client to access your device.
 
 2. **Run the following command:**
@@ -82,7 +78,7 @@ For **USG** devices:
 
 ## 6. Do I need to pre-create DNS records in Cloudflare before configuring DDNS on my UniFi device?
 
-Yes, for subdomains (e.g., `sub.example.com`), you should manually create an A record in Cloudflare before configuring DDNS on your UniFi device.
+Yes, for subdomains (e.g., `sub.example.com`), you should manually create an A record (or AAAA record for IPv6) in Cloudflare before configuring DDNS on your UniFi device.
 
 ## 7. How do I configure DDNS for wildcard domains in Cloudflare?
 
@@ -96,7 +92,7 @@ The User API token should have the following permissions:
   - **Read**
   - **DNS Edit**
 
-Ensure the token is scoped to only one specific zone (domain) you intend to update.
+The token needs these permissions on every zone it should manage. Multiple zones are supported; each hostname must match exactly one DNS record across the zones the token can see.
 
 ## 9. How frequently does the UniFi device update the DDNS record?
 
@@ -117,11 +113,9 @@ To support scenarios where such a router needs to be externally available (e.g. 
 ## 12. What should I do if I continue to experience issues with DDNS updates?
 
 - **Verify Configuration:**
-
   - Double-check all entries in your DDNS settings for accuracy.
 
 - **Check Logs:**
-
   - Review system logs on your UniFi device for error messages.
 
 - **Seek Community Assistance:**
