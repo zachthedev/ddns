@@ -9,6 +9,7 @@ describe('pushNtfy', () => {
 		env = createMockEnv();
 		// Mock console methods
 		vi.spyOn(console, 'error').mockImplementation(() => {});
+		vi.spyOn(console, 'log').mockImplementation(() => {});
 		// Mock global fetch to prevent actual notifications
 		vi.stubGlobal('fetch', vi.fn());
 	});
@@ -19,17 +20,23 @@ describe('pushNtfy', () => {
 	});
 
 	describe('Environment validation', () => {
-		it('should throw error when NTFY_URL is missing', async () => {
+		it('should skip notification when NTFY_URL is empty', async () => {
 			env.NTFY_URL = '';
+			const mockFetch = vi.mocked(fetch);
 
-			await expect(pushNtfy('test message', env)).rejects.toThrow('NTFY_URL missing from env or empty');
+			await expect(pushNtfy('test message', env)).resolves.toBeUndefined();
+
+			expect(mockFetch).not.toHaveBeenCalled();
 		});
 
-		it('should throw error when NTFY_URL is undefined', async () => {
+		it('should skip notification when NTFY_URL is undefined', async () => {
 			// @ts-expect-error - Testing undefined scenario
 			delete env.NTFY_URL;
+			const mockFetch = vi.mocked(fetch);
 
-			await expect(pushNtfy('test message', env)).rejects.toThrow('NTFY_URL missing from env or empty');
+			await expect(pushNtfy('test message', env)).resolves.toBeUndefined();
+
+			expect(mockFetch).not.toHaveBeenCalled();
 		});
 	});
 
@@ -44,6 +51,7 @@ describe('pushNtfy', () => {
 				method: 'POST',
 				body: 'Single notification message',
 				headers: { 'Content-Type': 'text/plain' },
+				signal: expect.any(AbortSignal),
 			});
 			expect(mockFetch).toHaveBeenCalledTimes(1);
 		});
@@ -66,6 +74,7 @@ describe('pushNtfy', () => {
 				method: 'POST',
 				body: 'Single message in array',
 				headers: { 'Content-Type': 'text/plain' },
+				signal: expect.any(AbortSignal),
 			});
 			expect(mockFetch).toHaveBeenCalledTimes(1);
 		});
@@ -96,6 +105,7 @@ describe('pushNtfy', () => {
 				method: 'POST',
 				body: expectedBody,
 				headers: { 'Content-Type': 'text/plain' },
+				signal: expect.any(AbortSignal),
 			});
 			expect(mockFetch).toHaveBeenCalledTimes(1);
 		});
@@ -116,6 +126,7 @@ describe('pushNtfy', () => {
 				method: 'POST',
 				body: expectedBody,
 				headers: { 'Content-Type': 'text/plain' },
+				signal: expect.any(AbortSignal),
 			});
 			expect(mockFetch).toHaveBeenCalledTimes(1);
 		});
@@ -179,6 +190,7 @@ describe('pushNtfy', () => {
 				method: 'POST',
 				body: 'Integration test message',
 				headers: { 'Content-Type': 'text/plain' },
+				signal: expect.any(AbortSignal),
 			});
 		});
 
@@ -194,6 +206,7 @@ describe('pushNtfy', () => {
 				method: 'POST',
 				body: 'Custom server test',
 				headers: { 'Content-Type': 'text/plain' },
+				signal: expect.any(AbortSignal),
 			});
 		});
 	});

@@ -1,6 +1,9 @@
 export async function pushNtfy(messages: string | string[], env: Env): Promise<void> {
+	// The ntfy integration is optional; without the secret, updates proceed
+	// silently instead of failing after the DNS write.
 	if (!env.NTFY_URL) {
-		throw new Error('NTFY_URL missing from env or empty');
+		console.log('NTFY_URL not configured; skipping notification.');
+		return;
 	}
 
 	let message: string;
@@ -26,6 +29,8 @@ export async function pushNtfy(messages: string | string[], env: Env): Promise<v
 			method: 'POST',
 			body: message,
 			headers: { 'Content-Type': 'text/plain' },
+			// Best-effort notification; never let a hung ntfy server hold the request
+			signal: AbortSignal.timeout(5000),
 		});
 	} catch (e) {
 		console.error('Failed to send ntfy push: ', e);

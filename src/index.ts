@@ -44,7 +44,12 @@ function constructClientOptions(request: Request): ClientOptions {
 		throw new HttpError(401, 'Invalid authorization credentials.');
 	}
 
-	const decoded = atob(token);
+	let decoded: string;
+	try {
+		decoded = atob(token);
+	} catch {
+		throw new HttpError(401, 'Invalid authorization credentials.');
+	}
 	const delimiterIndex = decoded.indexOf(':');
 	// eslint-disable-next-line no-control-regex
 	if (delimiterIndex === -1 || /[\0-\x1F\x7F]/.test(decoded)) {
@@ -209,15 +214,13 @@ async function updateHostnames(clientOptions: ClientOptions, newRecords: Address
 
 export default {
 	async fetch(request: Request, env: Env): Promise<Response> {
-		// Clone before reading so the original body stays available downstream
-		const clonedRequest = request.clone();
-		const logDetails = {
+		// The handler only consumes query params; never log request bodies
+		// (unauthenticated callers could write arbitrary content into logs).
+		console.log('Incoming request:', {
 			ip: request.headers.get('CF-Connecting-IP'),
 			method: request.method,
 			url: request.url,
-			body: request.method !== 'GET' && request.method !== 'HEAD' ? await clonedRequest.text() : undefined,
-		};
-		console.log('Incoming request:', logDetails);
+		});
 
 		try {
 			const clientOptions = constructClientOptions(request);

@@ -18,7 +18,7 @@ This is a fork from [willswire](https://github.com/willswire/unifi-ddns) with th
 
 ## Why Use This?
 
-UniFi devices do not natively support Cloudflare as a DDNS provider. This script bridges that gap, allowing your UniFi device to keep your DNS records updated with your public IP address.
+UniFi Network Application 9.1.92+ ships native Cloudflare DDNS support. This worker remains useful for multi-hostname updates, preserving proxy status and TTL on existing records, change-only ntfy notifications, multi-zone tokens, and older firmware without native support.
 
 ## 🚀 **Setup Overview**
 
@@ -73,7 +73,7 @@ injected at deploy time from the environment.
 1. Go to the [Cloudflare Dashboard](https://dash.cloudflare.com/).
 2. Navigate to **Profile > API Tokens**
 3. Create a token using the **Edit zone DNS** template.
-4. Scope the token to **one** specific zone.
+4. Scope the token to the zone(s) you want to update. One zone keeps the blast radius small; multiple zones are supported, but each hostname must match exactly one record across them.
 5. Save the token securely.
 
 ### 3. **Configure UniFi OS**
@@ -86,7 +86,7 @@ injected at deploy time from the environment.
    - **Username:** Cloudflare Account Email Address (e.g., `you@example.com`)
    - **Password:** Cloudflare User API Token _(not an Account API Token)_
    - **Server:** `<worker-name>.<worker-subdomain>.workers.dev/update?ip=%i&hostname=%h`
-     _(Omit `https://`)_
+     _(Omit `https://`. To update several records at once, use a comma-separated list: `hostnames=example.com,*.example.com`)_
 
 ## 🛠️ **Testing & Troubleshooting**
 

@@ -108,11 +108,12 @@ describe('Worker fetch handler', () => {
 
 			const response = await worker.fetch(request, env);
 
-			expect(response.status).toBe(500);
+			// Malformed base64 is a client error, same as any other bad credential
+			expect(response.status).toBe(401);
 			const body = (await response.json()) as any;
 			expect(body).toEqual({
 				success: false,
-				error: 'Internal Server Error',
+				error: 'Invalid authorization credentials.',
 			});
 		});
 
