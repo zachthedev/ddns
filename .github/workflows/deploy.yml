@@ -36,4 +36,5 @@ jobs:
           KV_NAMESPACE_ID: ${{ secrets.KV_NAMESPACE_ID }}
           KV_NAMESPACE_PREVIEW_ID: ${{ secrets.KV_NAMESPACE_PREVIEW_ID }}
           D1_DATABASE_ID: ${{ secrets.D1_DATABASE_ID }}
+          CUSTOM_DOMAIN: ${{ secrets.CUSTOM_DOMAIN }}
           ACCESS_KEY: ${{ secrets.ACCESS_KEY }}
