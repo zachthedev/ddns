@@ -5,6 +5,15 @@
 	"compatibility_date": "2026-06-01",
 	"compatibility_flags": ["nodejs_compat"],
 
+	// Client-facing endpoint. Declared in config so the custom domain is
+	// reproducible rather than dashboard-only.
+	"routes": [
+		{
+			"pattern": "ddns.quist.network",
+			"custom_domain": true,
+		},
+	],
+
 	// account_id is intentionally absent: wrangler reads CLOUDFLARE_ACCOUNT_ID
 	// from the environment (GitHub Actions secret in CI, .env.local locally).
 
