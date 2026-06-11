@@ -11,10 +11,29 @@ import {
 } from './helpers/mocks';
 import { Cloudflare } from 'cloudflare';
 
-// Mock the Cloudflare SDK
-vi.mock('cloudflare', () => ({
-	Cloudflare: vi.fn(),
-}));
+// vi.mock factories are hoisted above import declarations, so any class or
+// variable the factory references must be created inside vi.hoisted() so it
+// is also hoisted and available when the factory runs.
+const { MockAPIError } = vi.hoisted(() => {
+	class MockAPIError extends Error {
+		status: number;
+		constructor(status: number, message = 'API error') {
+			super(message);
+			this.name = 'APIError';
+			this.status = status;
+		}
+	}
+	return { MockAPIError };
+});
+
+// The cloudflare module is mocked, but src/index.ts uses Cloudflare.APIError
+// as a static (error instanceof Cloudflare.APIError). The mock factory must
+// expose a real class on that property so instanceof checks work in tests.
+vi.mock('cloudflare', () => {
+	const MockCF = vi.fn();
+	(MockCF as any).APIError = MockAPIError;
+	return { Cloudflare: MockCF };
+});
 
 // Mock pushNtfy to prevent actual notifications
 vi.mock('../src/pushNtfy', () => ({
@@ -64,6 +83,91 @@ describe('Worker fetch handler', () => {
 	afterEach(() => {
 		vi.restoreAllMocks();
 		vi.clearAllMocks();
+	});
+
+	// -------------------------------------------------------------------------
+	// Rate limiter  (RATE_LIMITER binding, first thing in the try block)
+	// -------------------------------------------------------------------------
+
+	describe('Rate limiter', () => {
+		const validAuth = { Authorization: createAuthHeader('user@example.com', 'token') };
+
+		it('allows the request when RATE_LIMITER returns success:true', async () => {
+			const rateLimiterMock = vi.mocked(env.RATE_LIMITER) as any;
+			rateLimiterMock.limit.mockResolvedValue({ success: true });
+
+			mockCloudflareClient.user.tokens.verify.mockResolvedValue({ id: 'tid', status: 'active' } as any);
+			mockCloudflareClient.zones.list.mockResolvedValue({ result: [] } as any);
+
+			const request = createMockRequest('https://example.com/update?ip4=1.2.3.4&hostnames=test.example.com', {
+				headers: validAuth,
+			});
+
+			const response = await worker.fetch(request, env, ctx);
+
+			// Auth and param parsing ran; rejected by missing zone, not rate limit.
+			expect(response.status).toBe(400);
+		});
+
+		it('returns 429 with rate-limit error body when RATE_LIMITER returns success:false', async () => {
+			const rateLimiterMock = vi.mocked(env.RATE_LIMITER) as any;
+			rateLimiterMock.limit.mockResolvedValue({ success: false });
+
+			const request = createMockRequest('https://example.com/update?ip4=1.2.3.4&hostnames=test.example.com', {
+				headers: validAuth,
+			});
+
+			const response = await worker.fetch(request, env, ctx);
+
+			expect(response.status).toBe(429);
+			const body = (await response.json()) as any;
+			expect(body).toEqual({ success: false, error: 'Rate limit exceeded.' });
+		});
+
+		it('does not call parseAuthorization or tokens.verify when rate limited', async () => {
+			const rateLimiterMock = vi.mocked(env.RATE_LIMITER) as any;
+			rateLimiterMock.limit.mockResolvedValue({ success: false });
+
+			// No Authorization header — if auth ran first it would return 401, not 429
+			const request = createMockRequest('https://example.com/update?ip4=1.2.3.4&hostnames=test.example.com');
+
+			const response = await worker.fetch(request, env, ctx);
+
+			expect(response.status).toBe(429);
+			expect(mockCloudflareClient.user.tokens.verify).not.toHaveBeenCalled();
+		});
+
+		it('uses the CF-Connecting-IP header as the rate limit key', async () => {
+			const rateLimiterMock = vi.mocked(env.RATE_LIMITER) as any;
+			rateLimiterMock.limit.mockResolvedValue({ success: true });
+
+			mockCloudflareClient.user.tokens.verify.mockResolvedValue({ id: 'tid', status: 'active' } as any);
+			mockCloudflareClient.zones.list.mockResolvedValue({ result: [] } as any);
+
+			const request = createMockRequest('https://example.com/update?ip4=1.2.3.4&hostnames=test.example.com', {
+				headers: { ...validAuth, 'CF-Connecting-IP': '10.20.30.40' },
+			});
+
+			await worker.fetch(request, env, ctx);
+
+			expect(rateLimiterMock.limit).toHaveBeenCalledWith({ key: '10.20.30.40' });
+		});
+
+		it('uses "unknown" as the rate limit key when CF-Connecting-IP is absent', async () => {
+			const rateLimiterMock = vi.mocked(env.RATE_LIMITER) as any;
+			rateLimiterMock.limit.mockResolvedValue({ success: false });
+
+			// createMockRequest adds a default CF-Connecting-IP; build the request
+			// manually to omit it entirely.
+			const request = new Request('https://example.com/update?ip4=1.2.3.4&hostnames=test.example.com', {
+				method: 'GET',
+				headers: { Authorization: createAuthHeader('user', 'token') },
+			});
+
+			await worker.fetch(request, env, ctx);
+
+			expect(rateLimiterMock.limit).toHaveBeenCalledWith({ key: 'unknown' });
+		});
 	});
 
 	// -------------------------------------------------------------------------
@@ -598,10 +702,10 @@ describe('Worker fetch handler', () => {
 
 			const response = await worker.fetch(request, env, ctx);
 
-			// Fails with 'No matching record found' for the first hostname, but
-			// confirms the comma-separated list was parsed and the first lookup ran.
+			// Fails with 'No matching record found'; both records are queried in
+			// parallel so both list calls fire before the error propagates.
 			expect(response.status).toBe(400);
-			expect(mockCloudflareClient.dns.records.list).toHaveBeenCalledTimes(1);
+			expect(mockCloudflareClient.dns.records.list).toHaveBeenCalledTimes(2);
 		});
 
 		it('adds an AAAA record per hostname when ip6 is provided alongside ip4', async () => {
@@ -639,6 +743,59 @@ describe('Worker fetch handler', () => {
 			expect(body.data.records).toHaveLength(4);
 			// All four DNS record lookups ran
 			expect(mockCloudflareClient.dns.records.list).toHaveBeenCalledTimes(4);
+		});
+
+		it('rejects ntfy param that exceeds 512 characters', async () => {
+			const longUrl = `https://ntfy.example.com/${'a'.repeat(490)}`;
+			const request = createMockRequest(
+				`https://example.com/update?ip4=1.2.3.4&hostnames=test.example.com&ntfy=${encodeURIComponent(longUrl)}`,
+				{ headers: validAuth },
+			);
+
+			const response = await worker.fetch(request, env, ctx);
+
+			expect(response.status).toBe(422);
+			const body = (await response.json()) as any;
+			expect(body).toEqual({ success: false, error: "The 'ntfy' parameter is too long." });
+		});
+
+		it('rejects ntfy param that is not a valid URL', async () => {
+			const request = createMockRequest('https://example.com/update?ip4=1.2.3.4&hostnames=test.example.com&ntfy=not-a-url', {
+				headers: validAuth,
+			});
+
+			const response = await worker.fetch(request, env, ctx);
+
+			expect(response.status).toBe(422);
+			const body = (await response.json()) as any;
+			expect(body).toEqual({ success: false, error: "The 'ntfy' parameter must be a valid https URL." });
+		});
+
+		it('rejects ntfy param that uses a non-https protocol', async () => {
+			const request = createMockRequest(
+				'https://example.com/update?ip4=1.2.3.4&hostnames=test.example.com&ntfy=http://ntfy.example.com/topic',
+				{ headers: validAuth },
+			);
+
+			const response = await worker.fetch(request, env, ctx);
+
+			expect(response.status).toBe(422);
+			const body = (await response.json()) as any;
+			expect(body).toEqual({ success: false, error: "The 'ntfy' parameter must be a valid https URL." });
+		});
+
+		it('accepts a valid https ntfy URL and proceeds to update', async () => {
+			mockCloudflareClient.zones.list.mockResolvedValue({ result: [] } as any);
+
+			const request = createMockRequest(
+				'https://example.com/update?ip4=1.2.3.4&hostnames=test.example.com&ntfy=https%3A%2F%2Fntfy.example.com%2Ftopic',
+				{ headers: validAuth },
+			);
+
+			const response = await worker.fetch(request, env, ctx);
+
+			// Fails with 'No zones available' but confirms ntfy validation passed
+			expect(response.status).toBe(400);
 		});
 	});
 
@@ -679,6 +836,81 @@ describe('Worker fetch handler', () => {
 				error: 'Authentication failed: token expired',
 			});
 		});
+
+		it('returns 401 when tokens.verify rejects with a Cloudflare APIError status 400', async () => {
+			const apiError = Object.assign(Object.create(MockAPIError.prototype), { status: 400, message: 'bad request' });
+			mockCloudflareClient.user.tokens.verify.mockRejectedValue(apiError);
+
+			const request = createMockRequest('https://example.com/update?ip4=1.2.3.4&hostnames=test.example.com', {
+				headers: validAuth,
+			});
+
+			const response = await worker.fetch(request, env, ctx);
+
+			expect(response.status).toBe(401);
+			const body = (await response.json()) as any;
+			expect(body).toEqual({ success: false, error: 'Authentication failed: invalid token.' });
+		});
+
+		it('returns 401 when tokens.verify rejects with a Cloudflare APIError status 401', async () => {
+			const apiError = Object.assign(Object.create(MockAPIError.prototype), { status: 401, message: 'unauthorized' });
+			mockCloudflareClient.user.tokens.verify.mockRejectedValue(apiError);
+
+			const request = createMockRequest('https://example.com/update?ip4=1.2.3.4&hostnames=test.example.com', {
+				headers: validAuth,
+			});
+
+			const response = await worker.fetch(request, env, ctx);
+
+			expect(response.status).toBe(401);
+			const body = (await response.json()) as any;
+			expect(body).toEqual({ success: false, error: 'Authentication failed: invalid token.' });
+		});
+
+		it('returns 401 when tokens.verify rejects with a Cloudflare APIError status 403', async () => {
+			const apiError = Object.assign(Object.create(MockAPIError.prototype), { status: 403, message: 'forbidden' });
+			mockCloudflareClient.user.tokens.verify.mockRejectedValue(apiError);
+
+			const request = createMockRequest('https://example.com/update?ip4=1.2.3.4&hostnames=test.example.com', {
+				headers: validAuth,
+			});
+
+			const response = await worker.fetch(request, env, ctx);
+
+			expect(response.status).toBe(401);
+			const body = (await response.json()) as any;
+			expect(body).toEqual({ success: false, error: 'Authentication failed: invalid token.' });
+		});
+
+		it('returns 500 when tokens.verify rejects with a Cloudflare APIError of unexpected status', async () => {
+			// Status 500 is not in the auth-error list; it rethrows and becomes a 500.
+			const apiError = Object.assign(Object.create(MockAPIError.prototype), { status: 500, message: 'server error' });
+			mockCloudflareClient.user.tokens.verify.mockRejectedValue(apiError);
+
+			const request = createMockRequest('https://example.com/update?ip4=1.2.3.4&hostnames=test.example.com', {
+				headers: validAuth,
+			});
+
+			const response = await worker.fetch(request, env, ctx);
+
+			expect(response.status).toBe(500);
+			const body = (await response.json()) as any;
+			expect(body).toEqual({ success: false, error: 'Internal Server Error' });
+		});
+
+		it('returns 500 when tokens.verify rejects with a plain Error (non-APIError)', async () => {
+			mockCloudflareClient.user.tokens.verify.mockRejectedValue(new Error('Network error'));
+
+			const request = createMockRequest('https://example.com/update?ip4=1.2.3.4&hostnames=test.example.com', {
+				headers: validAuth,
+			});
+
+			const response = await worker.fetch(request, env, ctx);
+
+			expect(response.status).toBe(500);
+			const body = (await response.json()) as any;
+			expect(body).toEqual({ success: false, error: 'Internal Server Error' });
+		});
 	});
 
 	// -------------------------------------------------------------------------
@@ -692,7 +924,9 @@ describe('Worker fetch handler', () => {
 			mockCloudflareClient.user.tokens.verify.mockResolvedValue({ id: 'tid', status: 'active' } as any);
 		});
 
-		it('skips zone listing and returns 200 when ALL records match their cached IPs', async () => {
+		// Gate OFF (ACCESS_KEY = ''): verify runs first, then fast-path check.
+		it('skips zone listing and returns 200 when ALL records match their cached IPs (gate off)', async () => {
+			env.ACCESS_KEY = '';
 			const kvMock = vi.mocked(env.DDNS_KV) as any;
 			// Cache contains a JSON entry with matching IP
 			kvMock.get.mockResolvedValue(JSON.stringify({ ip: '1.2.3.4', updatedAt: '2024-01-01T00:00:00.000Z' }));
@@ -715,6 +949,35 @@ describe('Worker fetch handler', () => {
 			});
 			// Short-circuits: zones.list must not be called
 			expect(mockCloudflareClient.zones.list).not.toHaveBeenCalled();
+			// Gate is off: verify MUST have been called before the fast-path check
+			expect(mockCloudflareClient.user.tokens.verify).toHaveBeenCalled();
+		});
+
+		// Gate ON (ACCESS_KEY non-empty): fast-path check runs before verify.
+		it('skips zone listing and tokens.verify when ALL records match cached IPs (gate on)', async () => {
+			env.ACCESS_KEY = 'gate-key';
+			const kvMock = vi.mocked(env.DDNS_KV) as any;
+			kvMock.get.mockResolvedValue(JSON.stringify({ ip: '1.2.3.4', updatedAt: '2024-01-01T00:00:00.000Z' }));
+
+			const request = createMockRequest('https://example.com/update?ip4=1.2.3.4&hostnames=test.example.com', {
+				headers: { Authorization: createAuthHeader('gate-key', 'cf-token') },
+			});
+
+			const response = await worker.fetch(request, env, ctx);
+
+			expect(response.status).toBe(200);
+			const body = (await response.json()) as any;
+			expect(body).toEqual({
+				success: true,
+				message: 'No IP change detected',
+				data: {
+					updated: false,
+					records: [{ hostname: 'test.example.com', type: 'A', ip: '1.2.3.4', updated: false }],
+				},
+			});
+			expect(mockCloudflareClient.zones.list).not.toHaveBeenCalled();
+			// Gate is on: verify must NOT be called on a full cache hit
+			expect(mockCloudflareClient.user.tokens.verify).not.toHaveBeenCalled();
 		});
 
 		it('uses cache key ip:<hostname>:<type>', async () => {
@@ -759,7 +1022,10 @@ describe('Worker fetch handler', () => {
 
 			await worker.fetch(request, env, ctx);
 
-			const [, rawValue, putOptions] = kvMock.put.mock.calls[0];
+			// Find the ip-namespace put (as opposed to any zones-namespace put).
+			const ipPutCall = (kvMock.put.mock.calls as [string, string, unknown][]).find(([key]) => key.startsWith('ip:'));
+			expect(ipPutCall).toBeDefined();
+			const [, rawValue, putOptions] = ipPutCall ?? ['', '', {}];
 			const parsed = JSON.parse(rawValue) as { ip: string; updatedAt: string };
 			expect(parsed.ip).toBe('1.2.3.4');
 			expect(typeof parsed.updatedAt).toBe('string');
@@ -884,6 +1150,146 @@ describe('Worker fetch handler', () => {
 			// The cached entry appears as updated:false
 			const cachedEntry = (body.data.records as any[]).find((r: any) => r.hostname === 'h1.example.com');
 			expect(cachedEntry).toMatchObject({ hostname: 'h1.example.com', updated: false });
+		});
+	});
+
+	// -------------------------------------------------------------------------
+	// Zones cache  (KV key zones:<tokenId>, TTL 300)
+	// -------------------------------------------------------------------------
+
+	describe('Zones cache', () => {
+		const validAuth = { Authorization: createAuthHeader('user@example.com', 'token') };
+
+		beforeEach(() => {
+			mockCloudflareClient.user.tokens.verify.mockResolvedValue({ id: 'token-id-123', status: 'active' } as any);
+		});
+
+		it('calls zones.list and queues a zones cache write when zones cache is a miss', async () => {
+			const kvMock = vi.mocked(env.DDNS_KV) as any;
+			// All gets return null: ip cache miss and zones cache miss
+			kvMock.get.mockResolvedValue(null);
+			kvMock.put.mockResolvedValue(undefined);
+
+			mockCloudflareClient.zones.list.mockResolvedValue({
+				result: [{ id: 'zone1', name: 'example.com' }],
+			} as any);
+			mockCloudflareClient.dns.records.list.mockResolvedValue({ result: [] } as any);
+
+			const request = createMockRequest('https://example.com/update?ip4=1.2.3.4&hostnames=test.example.com', {
+				headers: validAuth,
+			});
+
+			await worker.fetch(request, env, ctx);
+
+			// zones.list runs on a miss
+			expect(mockCloudflareClient.zones.list).toHaveBeenCalledTimes(1);
+			// The zones cache write rides waitUntil; at least one waitUntil call happened
+			expect(waitUntilMock).toHaveBeenCalled();
+			// Verify one of the waitUntil promises resolves to writeCachedZones
+			// by checking the KV put after awaiting all waitUntil args
+			const waitUntilArgs = (waitUntilMock.mock.calls as [Promise<void>][]).map(([p]) => p);
+			await Promise.allSettled(waitUntilArgs);
+			expect(kvMock.put).toHaveBeenCalledWith('zones:token-id-123', expect.any(String), { expirationTtl: 300 });
+		});
+
+		it('skips zones.list when zones cache is a hit and uses the cached zone for record lookup', async () => {
+			const kvMock = vi.mocked(env.DDNS_KV) as any;
+			const cachedZones = [{ id: 'zone-from-cache', name: 'example.com' }];
+
+			// Zones cache hit, ip cache miss
+			kvMock.get.mockImplementation((key: string) => {
+				if (key === 'zones:token-id-123') return Promise.resolve(JSON.stringify(cachedZones));
+				return Promise.resolve(null);
+			});
+			kvMock.put.mockResolvedValue(undefined);
+
+			mockCloudflareClient.dns.records.list.mockResolvedValue({
+				result: [{ id: 'r1', name: 'test.example.com', type: 'A', content: '1.2.3.0', proxied: false, ttl: 1 }],
+			} as any);
+			mockCloudflareClient.dns.records.update.mockResolvedValue(undefined);
+
+			const request = createMockRequest('https://example.com/update?ip4=1.2.3.4&hostnames=test.example.com', {
+				headers: validAuth,
+			});
+
+			const response = await worker.fetch(request, env, ctx);
+
+			expect(response.status).toBe(200);
+			// zones.list NOT called — served from cache
+			expect(mockCloudflareClient.zones.list).not.toHaveBeenCalled();
+			// DNS record looked up with zone id from cache
+			expect(mockCloudflareClient.dns.records.list).toHaveBeenCalledWith(expect.objectContaining({ zone_id: 'zone-from-cache' }));
+		});
+
+		it('treats malformed zones JSON as a cache miss and falls back to zones.list', async () => {
+			const kvMock = vi.mocked(env.DDNS_KV) as any;
+			kvMock.get.mockImplementation((key: string) => {
+				if (key === 'zones:token-id-123') return Promise.resolve('not-valid-json');
+				return Promise.resolve(null);
+			});
+			kvMock.put.mockResolvedValue(undefined);
+
+			mockCloudflareClient.zones.list.mockResolvedValue({
+				result: [{ id: 'zone1', name: 'example.com' }],
+			} as any);
+			mockCloudflareClient.dns.records.list.mockResolvedValue({ result: [] } as any);
+
+			const request = createMockRequest('https://example.com/update?ip4=1.2.3.4&hostnames=test.example.com', {
+				headers: validAuth,
+			});
+
+			await worker.fetch(request, env, ctx);
+
+			// Fell back to zones.list
+			expect(mockCloudflareClient.zones.list).toHaveBeenCalledTimes(1);
+		});
+
+		it('treats a non-array zones JSON value as a cache miss and falls back to zones.list', async () => {
+			const kvMock = vi.mocked(env.DDNS_KV) as any;
+			kvMock.get.mockImplementation((key: string) => {
+				if (key === 'zones:token-id-123') return Promise.resolve(JSON.stringify({ id: 'z', name: 'x' }));
+				return Promise.resolve(null);
+			});
+			kvMock.put.mockResolvedValue(undefined);
+
+			mockCloudflareClient.zones.list.mockResolvedValue({
+				result: [{ id: 'zone1', name: 'example.com' }],
+			} as any);
+			mockCloudflareClient.dns.records.list.mockResolvedValue({ result: [] } as any);
+
+			const request = createMockRequest('https://example.com/update?ip4=1.2.3.4&hostnames=test.example.com', {
+				headers: validAuth,
+			});
+
+			await worker.fetch(request, env, ctx);
+
+			expect(mockCloudflareClient.zones.list).toHaveBeenCalledTimes(1);
+		});
+
+		it('writes zones cache with expirationTtl 300 via waitUntil', async () => {
+			const kvMock = vi.mocked(env.DDNS_KV) as any;
+			kvMock.get.mockResolvedValue(null);
+			kvMock.put.mockResolvedValue(undefined);
+
+			mockCloudflareClient.zones.list.mockResolvedValue({
+				result: [{ id: 'zone1', name: 'example.com' }],
+			} as any);
+			mockCloudflareClient.dns.records.list.mockResolvedValue({ result: [] } as any);
+
+			const request = createMockRequest('https://example.com/update?ip4=1.2.3.4&hostnames=test.example.com', {
+				headers: validAuth,
+			});
+
+			await worker.fetch(request, env, ctx);
+
+			const waitUntilArgs = (waitUntilMock.mock.calls as [Promise<void>][]).map(([p]) => p);
+			await Promise.allSettled(waitUntilArgs);
+
+			expect(kvMock.put).toHaveBeenCalledWith('zones:token-id-123', expect.any(String), { expirationTtl: 300 });
+			const zonesCall = (kvMock.put.mock.calls as [string, string, unknown][]).find(([k]) => k.startsWith('zones:'));
+			expect(zonesCall).toBeDefined();
+			const zonesJson = JSON.parse((zonesCall ?? ['', '[]'])[1]) as unknown;
+			expect(Array.isArray(zonesJson)).toBe(true);
 		});
 	});
 
@@ -1086,7 +1492,10 @@ describe('Worker fetch handler', () => {
 				ttl: 300,
 			});
 
-			expect(pushNtfyMock).toHaveBeenCalledWith(["DNS record for 'test.example.com' ('A') updated to '1.2.3.5'"], env);
+			// pushNtfy is called via waitUntil on a change; resolve all waitUntil args.
+			const waitUntilArgs = (waitUntilMock.mock.calls as [Promise<void>][]).map(([p]) => p);
+			await Promise.allSettled(waitUntilArgs);
+			expect(pushNtfyMock).toHaveBeenCalledWith(["DNS record for 'test.example.com' ('A') updated to '1.2.3.5'"], null);
 		});
 
 		it('does not call dns.records.update when existing content already matches target IP (DNS-delta no-op)', async () => {
@@ -1116,11 +1525,11 @@ describe('Worker fetch handler', () => {
 			expect(mockCloudflareClient.dns.records.update).not.toHaveBeenCalled();
 			// Cache is still written even on a no-op
 			expect((vi.mocked(env.DDNS_KV) as any).put).toHaveBeenCalled();
-			// No notification for unchanged records
-			expect(pushNtfyMock).toHaveBeenCalledWith([], env);
+			// No change: pushNtfy must NOT be called at all
+			expect(pushNtfyMock).not.toHaveBeenCalled();
 		});
 
-		it('passes empty array to pushNtfy when no records changed', async () => {
+		it('does not call pushNtfy when no records changed', async () => {
 			const { pushNtfy } = await import('../src/pushNtfy');
 			const pushNtfyMock = vi.mocked(pushNtfy);
 
@@ -1137,7 +1546,10 @@ describe('Worker fetch handler', () => {
 
 			await worker.fetch(request, env, ctx);
 
-			expect(pushNtfyMock).toHaveBeenCalledWith([], env);
+			// Resolve all waitUntil args to catch any deferred calls
+			const waitUntilArgs = (waitUntilMock.mock.calls as [Promise<void>][]).map(([p]) => p);
+			await Promise.allSettled(waitUntilArgs);
+			expect(pushNtfyMock).not.toHaveBeenCalled();
 		});
 
 		it('successfully updates multiple DNS records and sends a grouped notification', async () => {
@@ -1169,9 +1581,16 @@ describe('Worker fetch handler', () => {
 			expect(body.data.records).toHaveLength(2);
 
 			expect(mockCloudflareClient.dns.records.update).toHaveBeenCalledTimes(2);
+
+			// pushNtfy runs via waitUntil; await all deferred promises first.
+			const waitUntilArgs = (waitUntilMock.mock.calls as [Promise<void>][]).map(([p]) => p);
+			await Promise.allSettled(waitUntilArgs);
 			expect(pushNtfyMock).toHaveBeenCalledWith(
-				["DNS record for 'test1.example.com' ('A') updated to '1.2.3.5'", "DNS record for 'test2.example.com' ('A') updated to '1.2.3.5'"],
-				env,
+				expect.arrayContaining([
+					"DNS record for 'test1.example.com' ('A') updated to '1.2.3.5'",
+					"DNS record for 'test2.example.com' ('A') updated to '1.2.3.5'",
+				]),
+				null,
 			);
 		});
 
@@ -1210,7 +1629,7 @@ describe('Worker fetch handler', () => {
 			});
 		});
 
-		it('calls pushNtfy exactly once per request that reaches the update phase', async () => {
+		it('calls pushNtfy exactly once when a record changes', async () => {
 			const { pushNtfy } = await import('../src/pushNtfy');
 			const pushNtfyMock = vi.mocked(pushNtfy);
 
@@ -1228,6 +1647,8 @@ describe('Worker fetch handler', () => {
 
 			await worker.fetch(request, env, ctx);
 
+			const waitUntilArgs = (waitUntilMock.mock.calls as [Promise<void>][]).map(([p]) => p);
+			await Promise.allSettled(waitUntilArgs);
 			expect(pushNtfyMock).toHaveBeenCalledTimes(1);
 		});
 	});
@@ -1245,7 +1666,7 @@ describe('Worker fetch handler', () => {
 			(vi.mocked(env.DDNS_KV) as any).put.mockResolvedValue(undefined);
 		});
 
-		it('calls ctx.waitUntil with a Promise when a record reaches the DNS API', async () => {
+		it('calls ctx.waitUntil at least once with a Promise when a record reaches the DNS API', async () => {
 			mockCloudflareClient.zones.list.mockResolvedValue({
 				result: [{ id: 'zone1', name: 'example.com' }],
 			} as any);
@@ -1260,10 +1681,11 @@ describe('Worker fetch handler', () => {
 
 			await worker.fetch(request, env, ctx);
 
-			expect(waitUntilMock).toHaveBeenCalledTimes(1);
-			const [arg] = waitUntilMock.mock.calls[0] as [unknown];
-			// The argument must be a Promise (writeAuditEvents returns one)
-			expect(arg).toBeInstanceOf(Promise);
+			expect(waitUntilMock).toHaveBeenCalled();
+			// All waitUntil arguments must be Promises
+			for (const [arg] of waitUntilMock.mock.calls as [[unknown]]) {
+				expect(arg).toBeInstanceOf(Promise);
+			}
 		});
 
 		it('does NOT call ctx.waitUntil on the cache fast-path (nothing touched)', async () => {
@@ -1295,9 +1717,9 @@ describe('Worker fetch handler', () => {
 
 			await worker.fetch(request, env, ctx);
 
-			// Await the waitUntil promise so the batch call has been made
-			const [waitUntilArg] = waitUntilMock.mock.calls[0] as [Promise<void>];
-			await waitUntilArg;
+			// Await all waitUntil promises so the batch call has been made
+			const waitUntilArgs = (waitUntilMock.mock.calls as [Promise<void>][]).map(([p]) => p);
+			await Promise.allSettled(waitUntilArgs);
 
 			const auditDbMock = vi.mocked(env.AUDIT_DB) as any;
 			expect(auditDbMock.batch).toHaveBeenCalledTimes(1);
@@ -1335,8 +1757,9 @@ describe('Worker fetch handler', () => {
 
 			await worker.fetch(request, env, ctx);
 
-			const [waitUntilArg] = waitUntilMock.mock.calls[0] as [Promise<void>];
-			await waitUntilArg;
+			// Await all waitUntil promises so the audit batch has been written
+			const waitUntilArgs = (waitUntilMock.mock.calls as [Promise<void>][]).map(([p]) => p);
+			await Promise.allSettled(waitUntilArgs);
 
 			const auditDbMock = vi.mocked(env.AUDIT_DB) as any;
 			const stmtMock = auditDbMock.prepare();
@@ -1462,6 +1885,19 @@ describe('Worker fetch handler', () => {
 			expect(response.status).toBe(405);
 			const body = (await response.json()) as any;
 			expect(body).toEqual({ success: false, error: 'Method not allowed.' });
+		});
+
+		it('returns 404 for unknown paths instead of treating them as updates', async () => {
+			const request = createMockRequest('https://example.com/nic/update?ip4=1.2.3.4&hostnames=test.example.com', {
+				headers: validAuth,
+			});
+
+			const response = await worker.fetch(request, env, ctx);
+
+			expect(response.status).toBe(404);
+			const body = (await response.json()) as any;
+			expect(body).toEqual({ success: false, error: 'Not found.' });
+			expect(mockCloudflareClient.user.tokens.verify).not.toHaveBeenCalled();
 		});
 	});
 
@@ -1598,6 +2034,10 @@ describe('Worker fetch handler', () => {
 			expect(mockCloudflareClient.dns.records.update).toHaveBeenCalled();
 			expect(kvMock.put).toHaveBeenCalledWith('ip:test.example.com:A', expect.any(String), { expirationTtl: 2592000 });
 			expect(waitUntilMock).toHaveBeenCalled();
+
+			// pushNtfy called after resolving waitUntil promises
+			const waitUntilArgs = (waitUntilMock.mock.calls as [Promise<void>][]).map(([p]) => p);
+			await Promise.allSettled(waitUntilArgs);
 			expect(pushNtfyMock).toHaveBeenCalled();
 		});
 
@@ -1621,6 +2061,9 @@ describe('Worker fetch handler', () => {
 			expect(vi.mocked(Cloudflare)).toHaveBeenCalledWith({ apiToken: 'my-raw-api-token' });
 			const body = (await response.json()) as any;
 			expect(body.success).toBe(true);
+
+			const waitUntilArgs = (waitUntilMock.mock.calls as [Promise<void>][]).map(([p]) => p);
+			await Promise.allSettled(waitUntilArgs);
 			expect(pushNtfyMock).toHaveBeenCalledTimes(1);
 		});
 
@@ -1681,6 +2124,9 @@ describe('Worker fetch handler', () => {
 			expect(types.filter((t) => t === 'A')).toHaveLength(2);
 			expect(types.filter((t) => t === 'AAAA')).toHaveLength(2);
 			expect(mockCloudflareClient.dns.records.list).toHaveBeenCalledTimes(4);
+
+			const waitUntilArgs = (waitUntilMock.mock.calls as [Promise<void>][]).map(([p]) => p);
+			await Promise.allSettled(waitUntilArgs);
 			expect(pushNtfyMock).toHaveBeenCalledTimes(1);
 		});
 	});

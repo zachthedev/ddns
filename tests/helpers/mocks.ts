@@ -71,8 +71,8 @@ export const createMockEnv = (): Env => {
 	const env: Env = {
 		DDNS_KV: createMockKVNamespace(),
 		AUDIT_DB: createMockAuditDb(),
-		NTFY_URL: 'https://ntfy.example.com/test-topic',
 		ACCESS_KEY: '',
+		RATE_LIMITER: { limit: vi.fn().mockResolvedValue({ success: true }) },
 	};
 	return env;
 };

@@ -17,6 +17,36 @@ interface UpdateRequest {
 	records: DDNSRecord[];
 	/** Optional explicit zone scoping via the `zone` query parameter. */
 	zoneFilter: string | null;
+	/** Optional per-caller notification target via the `ntfy` query parameter. */
+	ntfyUrl: string | null;
+}
+
+const NTFY_URL_MAX_LENGTH = 512;
+
+/**
+ * Validates the caller-supplied ntfy URL. Any https endpoint is allowed
+ * (self-hosted servers included): the notification body is worker-built
+ * from API-validated DNS data and only fires after a successful update
+ * through a valid token, so the relay value to an abuser is negligible.
+ */
+function resolveNtfyUrl(searchParams: URLSearchParams): string | null {
+	const raw = searchParams.get('ntfy')?.trim() ?? null;
+	if (raw === null || raw === '') {
+		return null;
+	}
+	if (raw.length > NTFY_URL_MAX_LENGTH) {
+		throw new HttpError(422, "The 'ntfy' parameter is too long.");
+	}
+	let parsed: URL;
+	try {
+		parsed = new URL(raw);
+	} catch {
+		throw new HttpError(422, "The 'ntfy' parameter must be a valid https URL.");
+	}
+	if (parsed.protocol !== 'https:') {
+		throw new HttpError(422, "The 'ntfy' parameter must be a valid https URL.");
+	}
+	return raw;
 }
 
 // KV is a pure cache; DNS itself is the source of truth for the last IP.
@@ -217,6 +247,7 @@ function constructDNSRecords(request: Request): UpdateRequest {
 	const { v4, v6 } = resolveIps(searchParams, request);
 	const hostnameParam = searchParams.get('hostnames')?.trim() ?? null;
 	const zoneFilter = searchParams.get('zone')?.trim() ?? null;
+	const ntfyUrl = resolveNtfyUrl(searchParams);
 
 	if (hostnameParam === null || hostnameParam === '') {
 		throw new HttpError(422, "Missing 'hostnames' parameter.");
@@ -240,7 +271,7 @@ function constructDNSRecords(request: Request): UpdateRequest {
 		}
 	}
 
-	return { records, zoneFilter: zoneFilter === '' ? null : zoneFilter };
+	return { records, zoneFilter: zoneFilter === '' ? null : zoneFilter, ntfyUrl };
 }
 
 /** Reads a record's cached IP; any failure or unparseable entry is a miss. */
@@ -269,11 +300,148 @@ async function writeCachedIp(env: Env, record: DDNSRecord): Promise<void> {
 
 /** Verifies the token is active and returns its ID (the audit tenant key). */
 async function verifyToken(cloudflare: Cloudflare): Promise<string> {
-	const verification = await cloudflare.user.tokens.verify();
+	let verification: { id: string; status: string };
+	try {
+		verification = await cloudflare.user.tokens.verify();
+	} catch (error) {
+		// An invalid or expired token makes the verify call itself fail; that
+		// is a client auth problem, not a server error.
+		if (error instanceof Cloudflare.APIError && (error.status === 400 || error.status === 401 || error.status === 403)) {
+			throw new HttpError(401, 'Authentication failed: invalid token.');
+		}
+		throw error;
+	}
 	if (verification.status !== 'active') {
 		throw new HttpError(401, `Authentication failed: token ${verification.status}`);
 	}
 	return verification.id;
+}
+
+// Zone lists rarely change; caching them per token skips a zones.list call
+// on every consecutive update. Stale entries self-heal via TTL.
+const ZONES_TTL_SECONDS = 5 * 60;
+
+interface CachedZone {
+	id: string;
+	name: string;
+}
+
+function zonesCacheKey(tokenId: string): string {
+	return `zones:${tokenId}`;
+}
+
+async function readCachedZones(env: Env, tokenId: string): Promise<CachedZone[] | null> {
+	try {
+		const raw = await env.DDNS_KV.get(zonesCacheKey(tokenId));
+		if (raw === null) return null;
+		const parsed = JSON.parse(raw) as unknown;
+		return Array.isArray(parsed) ? (parsed as CachedZone[]) : null;
+	} catch (error) {
+		console.error(`Failed to read zones cache for token ${tokenId}:`, error);
+		return null;
+	}
+}
+
+async function writeCachedZones(env: Env, tokenId: string, zones: CachedZone[]): Promise<void> {
+	try {
+		await env.DDNS_KV.put(zonesCacheKey(tokenId), JSON.stringify(zones), { expirationTtl: ZONES_TTL_SECONDS });
+	} catch (error) {
+		console.error(`Failed to write zones cache for token ${tokenId}:`, error);
+	}
+}
+
+interface ProcessedRecord {
+	record: DDNSRecord;
+	result: RecordResult;
+	event: AuditEvent;
+	message: string | null;
+}
+
+/**
+ * Looks up, compares, and (when the DNS content differs) updates one record.
+ * Zone lookups run in parallel. Throws HttpError on no/ambiguous matches;
+ * with records processed concurrently, sibling records may already have
+ * updated when one throws (same partial-application semantics as the old
+ * sequential loop, which aborted mid-way).
+ */
+async function processRecord(
+	cloudflare: Cloudflare,
+	env: Env,
+	zones: CachedZone[],
+	record: DDNSRecord,
+	callerIp: string | null,
+	tokenId: string,
+): Promise<ProcessedRecord> {
+	const lists = await Promise.all(
+		zones.map(async (zone) => {
+			const { result } = await cloudflare.dns.records.list({
+				zone_id: zone.id,
+				name: record.name as Cloudflare.DNS.Records.RecordListParams.Name,
+				type: record.type,
+			});
+			return { zone, result };
+		}),
+	);
+	const matches = lists.flatMap(({ zone, result }) =>
+		result
+			.filter((rec) => rec.id)
+			.map((rec) => ({
+				id: rec.id,
+				content: rec.content,
+				// The SDK types mark proxied/ttl required, but the live API
+				// can omit them; default at the boundary.
+				proxied: rec.proxied ?? false,
+				comment: rec.comment,
+				ttl: rec.ttl ?? 1,
+				zoneId: zone.id,
+			})),
+	);
+
+	const match = matches[0];
+	if (match === undefined) {
+		throw new HttpError(400, `No matching record found for '${record.name}'. Create it manually first.`);
+	}
+	if (matches.length > 1) {
+		throw new HttpError(400, `Multiple matching records found for '${record.name}'. Specify a unique hostname per zone.`);
+	}
+
+	// Notifications and audit rows key off the actual DNS delta, never the
+	// cache: a cache miss on an unchanged record refreshes silently.
+	const changed = match.content !== record.content;
+	let message: string | null = null;
+	if (changed) {
+		await cloudflare.dns.records.update(match.id, {
+			content: record.content,
+			zone_id: match.zoneId,
+			name: record.name,
+			type: record.type,
+			proxied: match.proxied,
+			comment: match.comment,
+			ttl: match.ttl,
+		});
+
+		message = `DNS record for '${record.name}' ('${record.type}') updated to '${record.content}'`;
+		console.log(message);
+	} else {
+		console.log(`DNS record for '${record.name}' ('${record.type}') already at '${record.content}'. Refreshing cache only.`);
+	}
+
+	await writeCachedIp(env, record);
+	return {
+		record,
+		result: { hostname: record.name, type: record.type, ip: record.content, updated: changed },
+		event: {
+			occurredAt: new Date().toISOString(),
+			tokenId,
+			callerIp,
+			hostname: record.name,
+			recordType: record.type,
+			previousIp: match.content ?? null,
+			newIp: record.content,
+			outcome: changed ? 'updated' : 'no-change',
+		},
+		message,
+	};
 }
 
 async function updateHostnames(
@@ -283,16 +451,14 @@ async function updateHostnames(
 	env: Env,
 	ctx: ExecutionContext,
 ): Promise<Response> {
-	const { records, zoneFilter } = updateRequest;
+	const { records, zoneFilter, ntfyUrl } = updateRequest;
 	const cloudflare = new Cloudflare({ apiToken: auth.token });
-	const tokenId = await verifyToken(cloudflare);
 
-	// Fast path: when every record's cached IP already matches, skip the
-	// zone and record API calls entirely. Deliberately unaudited: nothing
-	// was touched, and polling devices would add hundreds of rows per day.
+	// Cache reads are KV-only and decide whether any API work exists at all.
 	const cachedIps = await Promise.all(records.map(async (record) => readCachedIp(env, record)));
 	const pending = records.filter((record, i) => cachedIps[i] !== record.content);
-	if (pending.length === 0) {
+
+	const allCurrentResponse = (): Response => {
 		console.log('All records match their cached IPs. Skipping DNS update and notification.');
 		return jsonResponse(
 			{
@@ -305,9 +471,28 @@ async function updateHostnames(
 			},
 			200,
 		);
+	};
+
+	// With the access gate on, the caller is already authenticated, so a full
+	// cache hit answers with ZERO Cloudflare API calls. Without the gate,
+	// verify first so unauthenticated probes can't use the fast path as an
+	// oracle. The fast path stays unaudited by design: nothing was touched.
+	const gated = Boolean(env.ACCESS_KEY);
+	if (gated && pending.length === 0) {
+		return allCurrentResponse();
 	}
 
-	let { result: zones } = await cloudflare.zones.list();
+	const tokenId = await verifyToken(cloudflare);
+	if (pending.length === 0) {
+		return allCurrentResponse();
+	}
+
+	let zones = await readCachedZones(env, tokenId);
+	if (zones === null) {
+		const { result } = await cloudflare.zones.list();
+		zones = result.map((zone) => ({ id: zone.id, name: zone.name }));
+		ctx.waitUntil(writeCachedZones(env, tokenId, zones));
+	}
 	if (zoneFilter !== null) {
 		zones = zones.filter((zone) => zone.name === zoneFilter);
 		if (zones.length === 0) {
@@ -319,95 +504,28 @@ async function updateHostnames(
 	}
 
 	const callerIp = request.headers.get('CF-Connecting-IP');
-	const updateMessages: string[] = [];
-	const results: RecordResult[] = [];
-	const auditEvents: AuditEvent[] = [];
+	const visibleZones = zones;
+	const processed = await Promise.all(
+		pending.map(async (record) => processRecord(cloudflare, env, visibleZones, record, callerIp, tokenId)),
+	);
+	const processedByRecord = new Map(processed.map((p) => [p.record, p]));
 
-	for (const record of records) {
-		if (!pending.includes(record)) {
-			results.push({ hostname: record.name, type: record.type, ip: record.content, updated: false });
-			continue;
-		}
+	const results: RecordResult[] = records.map(
+		(record) => processedByRecord.get(record)?.result ?? { hostname: record.name, type: record.type, ip: record.content, updated: false },
+	);
+	const updateMessages = processed.map((p) => p.message).filter((m): m is string => m !== null);
 
-		// Retrieve the matching DNS record across the visible zones
-		const matches: {
-			id: string;
-			content: string | undefined;
-			proxied: boolean;
-			comment: string | undefined;
-			ttl: number;
-			zoneId: string;
-		}[] = [];
-		for (const zone of zones) {
-			const { result: existing } = await cloudflare.dns.records.list({
-				zone_id: zone.id,
-				name: record.name as Cloudflare.DNS.Records.RecordListParams.Name,
-				type: record.type,
-			});
-			matches.push(
-				...existing
-					.filter((rec) => rec.id)
-					.map((rec) => ({
-						id: rec.id,
-						content: rec.content,
-						// The SDK types mark proxied/ttl required, but the live API
-						// can omit them; default at the boundary.
-						proxied: rec.proxied ?? false,
-						comment: rec.comment,
-						ttl: rec.ttl ?? 1,
-						zoneId: zone.id,
-					})),
-			);
-		}
-
-		const match = matches[0];
-		if (match === undefined) {
-			throw new HttpError(400, `No matching record found for '${record.name}'. Create it manually first.`);
-		}
-		if (matches.length > 1) {
-			throw new HttpError(400, `Multiple matching records found for '${record.name}'. Specify a unique hostname per zone.`);
-		}
-
-		// Notifications and audit rows key off the actual DNS delta, never
-		// the cache: a cache miss on an unchanged record refreshes silently.
-		const changed = match.content !== record.content;
-		if (changed) {
-			await cloudflare.dns.records.update(match.id, {
-				content: record.content,
-				zone_id: match.zoneId,
-				name: record.name,
-				type: record.type,
-				proxied: match.proxied,
-				comment: match.comment,
-				ttl: match.ttl,
-			});
-
-			const successMsg = `DNS record for '${record.name}' ('${record.type}') updated to '${record.content}'`;
-			console.log(successMsg);
-			updateMessages.push(successMsg);
-		} else {
-			console.log(`DNS record for '${record.name}' ('${record.type}') already at '${record.content}'. Refreshing cache only.`);
-		}
-
-		await writeCachedIp(env, record);
-		results.push({ hostname: record.name, type: record.type, ip: record.content, updated: changed });
-		auditEvents.push({
-			occurredAt: new Date().toISOString(),
-			tokenId,
-			callerIp,
-			hostname: record.name,
-			recordType: record.type,
-			previousIp: match.content ?? null,
-			newIp: record.content,
-			outcome: changed ? 'updated' : 'no-change',
-		});
+	// Audit writes and the change notification ride after the response;
+	// neither a D1 hiccup nor a slow ntfy server delays or fails the update.
+	ctx.waitUntil(
+		writeAuditEvents(
+			env,
+			processed.map((p) => p.event),
+		),
+	);
+	if (updateMessages.length > 0) {
+		ctx.waitUntil(pushNtfy(updateMessages, ntfyUrl));
 	}
-
-	// Audit writes ride after the response; a D1 hiccup never fails the update.
-	ctx.waitUntil(writeAuditEvents(env, auditEvents));
-
-	// Send one grouped notification for the records that actually changed
-	await pushNtfy(updateMessages, env);
 
 	const anyUpdated = updateMessages.length > 0;
 	return jsonResponse(
@@ -448,6 +566,14 @@ export default {
 		});
 
 		try {
+			// Edge-local per-IP throttle, before any other work. Best-effort
+			// (per-colo counters), which is the right tool for cost capping.
+			const rateKey = request.headers.get('CF-Connecting-IP') ?? 'unknown';
+			const { success: withinLimit } = await env.RATE_LIMITER.limit({ key: rateKey });
+			if (!withinLimit) {
+				return jsonResponse({ success: false, error: 'Rate limit exceeded.' }, 429);
+			}
+
 			const auth = parseAuthorization(request);
 			await checkAccess(env, request, auth);
 
@@ -457,6 +583,9 @@ export default {
 					throw new HttpError(405, 'Method not allowed.');
 				}
 				return await handleHistory(auth, request, env);
+			}
+			if (pathname !== '/update') {
+				throw new HttpError(404, 'Not found.');
 			}
 
 			const updateRequest = constructDNSRecords(request);

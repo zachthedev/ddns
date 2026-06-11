@@ -4,19 +4,15 @@ This FAQ addresses common issues and solutions for configuring UniFi devices to 
 
 ## 1. What is the correct server configuration for UniFi devices when using Cloudflare DDNS?
 
-The server configuration depends on your UniFi device model:
+- **Server:** `<worker-name>.<worker-subdomain>.workers.dev/update?ip4=%i&ip6=auto&hostnames=%h`
+- Include the full path with variables. Multiple hostnames are supported as a
+  comma-separated list, e.g. `hostnames=example.com,*.example.com`. Drop
+  `ip6=auto` if you have no IPv6. Append `&ntfy=https://ntfy.sh/<topic>` for
+  change notifications.
 
-- **Older Gateways (e.g., USG, USG Pro):**
-  - **Server:** `<worker-name>.<worker-subdomain>.workers.dev`
-  - **Note:** Do **not** include the path with variables.
-
-- **Newer Gateways (e.g., UDM series, UXG series):**
-  - **Server:** `<worker-name>.<worker-subdomain>.workers.dev/update?ip4=%i&ip6=auto&hostnames=%h`
-  - **Note:** Include the full path with variables. Multiple hostnames are
-    supported as a comma-separated list, e.g. `hostnames=example.com,*.example.com`.
-    Drop `ip6=auto` if you have no IPv6.
-
-This distinction is crucial to ensure the DDNS updates function correctly.
+This worker requires UniFi OS gateways whose DDNS client substitutes the full
+path (UDM series, UXG series, and similar). Legacy gateways (USG/USG Pro)
+send the old dyndns2 parameter names and are not supported.
 
 ## 2. How do I configure DDNS on my UniFi device?
 
@@ -26,7 +22,7 @@ This distinction is crucial to ensure the DDNS updates function correctly.
 2. **Create New Dynamic DNS Entry:**
    - **Service:** Select `custom`.
    - **Hostname:** Enter your desired hostname (e.g., `subdomain.example.com`).
-   - **Username:** Any value; the field is ignored.
+   - **Username:** Your `ACCESS_KEY` if the worker has one configured (recommended); any value otherwise. The field is never used for Cloudflare authentication.
    - **Password:** Enter your DNS-scoped Cloudflare API token.
    - **Server:** Enter the appropriate server address based on your device model (see FAQ #1).
 
@@ -37,14 +33,11 @@ This distinction is crucial to ensure the DDNS updates function correctly.
 
 Remove `https://` from the **Server** field before inputting the server address.
 
-## 4. What should I do if I encounter the error: "Failed to find zone '%h/nic/update?system=dyndns'"?
+## 4. What should I do if updates fail with `Missing IP` or `Missing 'hostnames' parameter`?
 
-This error typically occurs due to incorrect server configuration. Ensure that:
-
-- For **older gateways**, the server field contains only the FQDN without the path.
-- For **newer gateways**, the server field includes the full path with variables.
-
-Double-check your device model and adjust the server configuration accordingly.
+The Server field is missing the path with variables. It must include the full
+update path: `.../update?ip4=%i&ip6=auto&hostnames=%h` (see FAQ #1). A bare
+hostname in the Server field sends requests the worker rejects with 422.
 
 ## 5. How can I verify if my DDNS configuration is working correctly?
 

@@ -104,7 +104,9 @@ jobs:
       - name: Audit dependencies
         run: bun audit --audit-level=high
 
+      # On push to main, base == HEAD and the diff scan would no-op.
       - name: Scan for secrets
+        if: github.event_name == 'pull_request'
         uses: trufflesecurity/trufflehog@main
         with:
           path: ./
