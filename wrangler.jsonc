@@ -5,9 +5,9 @@
 	"compatibility_date": "2026-06-01",
 	"compatibility_flags": ["nodejs_compat"],
 
-	// Attach a custom domain with `CUSTOM_DOMAIN=your.domain bun run deploy`
-	// (local; your wrangler login has the zone access). Otherwise the worker
-	// is reachable at its <name>.<subdomain>.workers.dev URL.
+	// Set CUSTOM_DOMAIN to attach a custom domain; the deploy injects it as a
+	// custom_domain route. Otherwise the worker is served at its
+	// <name>.<subdomain>.workers.dev URL.
 
 	// account_id is intentionally absent: wrangler reads CLOUDFLARE_ACCOUNT_ID
 	// from the environment (GitHub Actions secret in CI, .env.local locally).
