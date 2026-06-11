@@ -11,10 +11,12 @@ A Cloudflare Worker script that enables UniFi devices (e.g., UDM-Pro, USG) to dy
 
 This is a fork from [willswire](https://github.com/willswire/unifi-ddns) with the following enhancements:
 
-- **Smart notifications** - Only sends [ntfy](https://ntfy.sh) alerts when your IP actually changes
+- **Smart notifications** - Only sends [ntfy](https://ntfy.sh) alerts when a DNS record actually changes
 - **API** - Returns structured JSON responses instead of plain text
 - **Multi-hostname support** - Update multiple hostnames in a single request using comma-separated values
-- **Multi-zone support** - API tokens can manage DNS records across multiple zones
+- **Multi-zone support** - API tokens can manage DNS records across multiple zones, with optional `zone=` scoping
+- **Dual-stack support** - Update A and AAAA records together with the `ip6` parameter
+- **Token-only auth** - DNS-scoped API tokens; no account email anywhere
 
 ## Why Use This?
 
@@ -91,10 +93,10 @@ injected at deploy time from the environment.
 3. Create New Dynamic DNS with the following information:
    - **Service:** `custom`
    - **Hostname:** `subdomain.example.com` or `example.com`
-   - **Username:** Cloudflare Account Email Address (e.g., `you@example.com`)
-   - **Password:** Cloudflare User API Token _(not an Account API Token)_
+   - **Username:** Any value (the field is ignored; the API token does the authenticating)
+   - **Password:** Cloudflare User API Token scoped to DNS edit _(not an Account API Token)_
    - **Server:** `<worker-name>.<worker-subdomain>.workers.dev/update?ip=%i&hostname=%h`
-     _(Omit `https://`. To update several records at once, use a comma-separated list: `hostnames=example.com,*.example.com`)_
+     _(Omit `https://`. To update several records at once, use a comma-separated list: `hostnames=example.com,*.example.com`. Optional parameters: `ip6=<address>` updates AAAA records alongside, `zone=example.com` restricts matching to one zone.)_
 
 ## 🛠️ **Testing & Troubleshooting**
 

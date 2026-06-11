@@ -26,7 +26,7 @@ export const createMockKVNamespace = (): KVNamespace => {
 
 	return {
 		get: vi.fn((key: string) => Promise.resolve(storage.get(key) ?? null)),
-		put: vi.fn((key: string, value: string) => {
+		put: vi.fn((key: string, value: string, _options?: { expirationTtl?: number }) => {
 			storage.set(key, value);
 			return Promise.resolve(undefined);
 		}),
@@ -69,9 +69,14 @@ export const createMockRequest = (
 	});
 };
 
-export const createAuthHeader = (email: string, token: string): string => {
-	const credentials = btoa(`${email}:${token}`);
-	return `Bearer ${credentials}`;
+/** Emits a Basic auth header: `Basic base64(user:token)`. */
+export const createAuthHeader = (user: string, token: string): string => {
+	return `Basic ${btoa(`${user}:${token}`)}`;
+};
+
+/** Emits a Bearer auth header: `Bearer <rawToken>`. */
+export const createBearerHeader = (rawToken: string): string => {
+	return `Bearer ${rawToken}`;
 };
 
 /**

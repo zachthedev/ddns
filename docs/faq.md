@@ -25,8 +25,8 @@ This distinction is crucial to ensure the DDNS updates function correctly.
 2. **Create New Dynamic DNS Entry:**
    - **Service:** Select `custom`.
    - **Hostname:** Enter your desired hostname (e.g., `subdomain.example.com`).
-   - **Username:** Enter your Cloudflare account email.
-   - **Password:** Enter your Cloudflare API token.
+   - **Username:** Any value; the field is ignored.
+   - **Password:** Enter your DNS-scoped Cloudflare API token.
    - **Server:** Enter the appropriate server address based on your device model (see FAQ #1).
 
 3. **Save Configuration:**
