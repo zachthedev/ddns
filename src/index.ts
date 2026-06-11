@@ -1,8 +1,37 @@
 import { Cloudflare, type ClientOptions } from 'cloudflare';
-import type { AAAARecord, ARecord } from 'cloudflare/resources/dns/records';
 import { pushNtfy } from './pushNtfy';
 
-type AddressableRecord = ARecord | AAAARecord;
+/**
+ * A DNS record this worker manages. Narrower than the SDK's record types:
+ * every field is required because the worker constructs them itself.
+ */
+interface DDNSRecord {
+	content: string;
+	name: string;
+	type: 'A' | 'AAAA';
+	ttl: number;
+}
+
+interface UpdateRequest {
+	records: DDNSRecord[];
+	/** Optional explicit zone scoping via the `zone` query parameter. */
+	zoneFilter: string | null;
+}
+
+// KV is a pure cache; DNS itself is the source of truth for the last IP.
+// Entries expire so stale identities can never accumulate (issue #151), at
+// the cost of one redundant API round-trip per record per TTL window.
+const KV_KEY_PREFIX = 'ip';
+const KV_TTL_SECONDS = 30 * 24 * 60 * 60;
+
+interface CachedIp {
+	ip: string;
+	updatedAt: string;
+}
+
+function cacheKey(record: DDNSRecord): string {
+	return `${KV_KEY_PREFIX}:${record.name}:${record.type}`;
+}
 
 export class HttpError extends Error {
 	constructor(
@@ -15,14 +44,19 @@ export class HttpError extends Error {
 	}
 }
 
+interface RecordResult {
+	hostname: string;
+	type: string;
+	ip: string;
+	updated: boolean;
+}
+
 interface UpdateResponseBody {
 	success: boolean;
 	message: string;
 	data: {
-		ip: string;
-		previousIp?: string | null;
 		updated: boolean;
-		records?: { hostname: string | undefined; type: string | undefined }[];
+		records: RecordResult[];
 	};
 }
 
@@ -33,51 +67,117 @@ function jsonResponse(body: UpdateResponseBody | { success: false; error: string
 	});
 }
 
+/**
+ * Extracts the Cloudflare API token from the Authorization header.
+ *
+ * Two forms are accepted:
+ * - `Basic base64(username:token)`: what UniFi devices send. The username is
+ *   ignored; only the DNS-scoped API token matters.
+ * - `Bearer token`: the raw token, for direct callers.
+ */
 function constructClientOptions(request: Request): ClientOptions {
 	const authHeader = request.headers.get('Authorization');
 	if (authHeader === null || authHeader === '') {
 		throw new HttpError(401, 'Authorization required.');
 	}
 
-	const [, token] = authHeader.split(' ');
-	if (token === undefined || token === '') {
+	const [scheme, payload] = authHeader.split(' ');
+	if (payload === undefined || payload === '') {
+		throw new HttpError(401, 'Invalid authorization credentials.');
+	}
+
+	if (scheme === 'Bearer') {
+		return { apiToken: payload };
+	}
+
+	if (scheme !== 'Basic') {
 		throw new HttpError(401, 'Invalid authorization credentials.');
 	}
 
 	let decoded: string;
 	try {
-		decoded = atob(token);
+		decoded = atob(payload);
 	} catch {
 		throw new HttpError(401, 'Invalid authorization credentials.');
 	}
+
 	const delimiterIndex = decoded.indexOf(':');
 	// eslint-disable-next-line no-control-regex
 	if (delimiterIndex === -1 || /[\0-\x1F\x7F]/.test(decoded)) {
 		throw new HttpError(401, 'Invalid authorization credentials.');
 	}
 
-	return {
-		apiEmail: decoded.slice(0, delimiterIndex),
-		apiToken: decoded.slice(delimiterIndex + 1),
-	};
+	const token = decoded.slice(delimiterIndex + 1);
+	if (token === '') {
+		throw new HttpError(401, 'Invalid authorization credentials.');
+	}
+
+	return { apiToken: token };
 }
 
-function constructDNSRecord(request: Request): AddressableRecord[] {
-	const { searchParams } = new URL(request.url);
-	let ip = (searchParams.get('ip') ?? searchParams.get('myip'))?.trim() ?? null;
-	const hostnameParam = (searchParams.get('hostnames') ?? searchParams.get('hostname'))?.trim() ?? null;
+interface ResolvedIps {
+	v4: string | null;
+	v6: string | null;
+}
 
-	if (ip === null || ip === '') {
-		throw new HttpError(422, "Missing 'ip' parameter. Use ip=auto to use the client IP.");
-	} else if (ip === 'auto') {
-		ip = request.headers.get('CF-Connecting-IP');
-		if (ip === null || ip === '') {
-			throw new HttpError(500, 'ip=auto specified but client IP could not be determined.');
+/**
+ * Resolves the requested IPs from the ip4/ip6 parameters.
+ *
+ * Literals are validated against their address family. `auto` takes the
+ * connecting IP only when it matches the slot's family and silently skips
+ * the slot otherwise: dual-stack callers (UniFi may dial over either
+ * family) can request both without flapping.
+ */
+function resolveIps(searchParams: URLSearchParams, request: Request): ResolvedIps {
+	const raw4 = searchParams.get('ip4')?.trim() ?? null;
+	const raw6 = searchParams.get('ip6')?.trim() ?? null;
+	const connectingIp = request.headers.get('CF-Connecting-IP');
+
+	let v4: string | null = null;
+	if (raw4 !== null && raw4 !== '') {
+		if (raw4 === 'auto') {
+			if (connectingIp?.includes('.')) {
+				v4 = connectingIp;
+			} else {
+				console.log('ip4=auto requested but the client did not connect over IPv4; skipping A records.');
+			}
+		} else if (!raw4.includes('.')) {
+			throw new HttpError(422, "The 'ip4' parameter must be a valid IPv4 address.");
+		} else {
+			v4 = raw4;
 		}
 	}
 
+	let v6: string | null = null;
+	if (raw6 !== null && raw6 !== '') {
+		if (raw6 === 'auto') {
+			if (connectingIp?.includes(':')) {
+				v6 = connectingIp;
+			} else {
+				console.log('ip6=auto requested but the client did not connect over IPv6; skipping AAAA records.');
+			}
+		} else if (!raw6.includes(':')) {
+			throw new HttpError(422, "The 'ip6' parameter must be a valid IPv6 address.");
+		} else {
+			v6 = raw6;
+		}
+	}
+
+	if (v4 === null && v6 === null) {
+		throw new HttpError(422, "Missing IP. Provide 'ip4' and/or 'ip6'; 'auto' uses the client IP.");
+	}
+
+	return { v4, v6 };
+}
+
+function constructDNSRecords(request: Request): UpdateRequest {
+	const { searchParams } = new URL(request.url);
+	const { v4, v6 } = resolveIps(searchParams, request);
+	const hostnameParam = searchParams.get('hostnames')?.trim() ?? null;
+	const zoneFilter = searchParams.get('zone')?.trim() ?? null;
+
 	if (hostnameParam === null || hostnameParam === '') {
-		throw new HttpError(422, "Missing 'hostname' parameter.");
+		throw new HttpError(422, "Missing 'hostnames' parameter.");
 	}
 	const hostnames = hostnameParam
 		.split(',')
@@ -87,16 +187,46 @@ function constructDNSRecord(request: Request): AddressableRecord[] {
 		throw new HttpError(422, 'No hostnames provided.');
 	}
 
-	// For each hostname, create the corresponding DNS record object.
-	return hostnames.map((hostname) => ({
-		content: ip,
-		name: hostname,
-		type: ip.includes('.') ? 'A' : 'AAAA',
-		ttl: 1,
-	}));
+	// Per hostname: an A record when ip4 resolved, an AAAA when ip6 did.
+	const records: DDNSRecord[] = [];
+	for (const hostname of hostnames) {
+		if (v4 !== null) {
+			records.push({ content: v4, name: hostname, type: 'A', ttl: 1 });
+		}
+		if (v6 !== null) {
+			records.push({ content: v6, name: hostname, type: 'AAAA', ttl: 1 });
+		}
+	}
+
+	return { records, zoneFilter: zoneFilter === '' ? null : zoneFilter };
 }
 
-async function updateHostnames(clientOptions: ClientOptions, newRecords: AddressableRecord[], env: Env): Promise<Response> {
+/** Reads a record's cached IP; any failure or unparseable entry is a miss. */
+async function readCachedIp(env: Env, record: DDNSRecord): Promise<string | null> {
+	try {
+		const raw = await env.DDNS_KV.get(cacheKey(record));
+		if (raw === null) return null;
+		const parsed = JSON.parse(raw) as Partial<CachedIp>;
+		return typeof parsed.ip === 'string' ? parsed.ip : null;
+	} catch (error) {
+		console.error(`Failed to read IP cache for ${cacheKey(record)}:`, error);
+		return null;
+	}
+}
+
+/** Caches a record's IP with a TTL so stale entries clean themselves up. */
+async function writeCachedIp(env: Env, record: DDNSRecord): Promise<void> {
+	const value: CachedIp = { ip: record.content, updatedAt: new Date().toISOString() };
+	try {
+		await env.DDNS_KV.put(cacheKey(record), JSON.stringify(value), { expirationTtl: KV_TTL_SECONDS });
+	} catch (error) {
+		console.error(`Failed to write IP cache for ${cacheKey(record)}:`, error);
+		// The cache is an optimization; the update already succeeded.
+	}
+}
+
+async function updateHostnames(clientOptions: ClientOptions, updateRequest: UpdateRequest, env: Env): Promise<Response> {
+	const { records, zoneFilter } = updateRequest;
 	const cloudflare = new Cloudflare(clientOptions);
 
 	// Verify token status
@@ -105,107 +235,120 @@ async function updateHostnames(clientOptions: ClientOptions, newRecords: Address
 		throw new HttpError(401, `Authentication failed: token ${tokenStatus}`);
 	}
 
-	// Track last known IP per user so unchanged IPs skip the update and
-	// notification entirely.
-	const userEmail = clientOptions.apiEmail ?? 'unknown';
-	const userKey = `ip:${userEmail}`;
-
-	const firstRecord = newRecords[0];
-	const currentIp = firstRecord?.content;
-	if (currentIp === undefined || currentIp === '') {
-		throw new HttpError(500, 'Unexpected error: no records provided');
-	}
-
-	let lastKnownIp: string | null = null;
-	try {
-		lastKnownIp = await env.DDNS_KV.get(userKey);
-	} catch (error) {
-		console.error(`Failed to get last known IP for user ${userEmail} from KV:`, error);
-		// Continue with the update if KV access fails
-	}
-
-	if (lastKnownIp === currentIp) {
-		console.log(`IP address ${currentIp} hasn't changed for user ${userEmail}. Skipping DNS update and notification.`);
+	// Fast path: when every record's cached IP already matches, skip the
+	// zone and record API calls entirely.
+	const cachedIps = await Promise.all(records.map(async (record) => readCachedIp(env, record)));
+	const pending = records.filter((record, i) => cachedIps[i] !== record.content);
+	if (pending.length === 0) {
+		console.log('All records match their cached IPs. Skipping DNS update and notification.');
 		return jsonResponse(
 			{
 				success: true,
 				message: 'No IP change detected',
-				data: { ip: currentIp, updated: false },
+				data: {
+					updated: false,
+					records: records.map((r) => ({ hostname: r.name, type: r.type, ip: r.content, updated: false })),
+				},
 			},
 			200,
 		);
 	}
 
-	const { result: zones } = await cloudflare.zones.list();
+	let { result: zones } = await cloudflare.zones.list();
+	if (zoneFilter !== null) {
+		zones = zones.filter((zone) => zone.name === zoneFilter);
+		if (zones.length === 0) {
+			throw new HttpError(400, `Zone '${zoneFilter}' not available with current permissions.`);
+		}
+	}
 	if (zones.length === 0) {
 		throw new HttpError(400, 'No zones available with current permissions.');
 	}
 
 	const updateMessages: string[] = [];
+	const results: RecordResult[] = [];
 
-	for (const newRecord of newRecords) {
-		// Retrieve the matching DNS record across all visible zones
-		const matches: { record: AddressableRecord & { id: string }; zoneId: string }[] = [];
+	for (const record of records) {
+		if (!pending.includes(record)) {
+			results.push({ hostname: record.name, type: record.type, ip: record.content, updated: false });
+			continue;
+		}
+
+		// Retrieve the matching DNS record across the visible zones
+		const matches: {
+			id: string;
+			content: string | undefined;
+			proxied: boolean;
+			comment: string | undefined;
+			ttl: number;
+			zoneId: string;
+		}[] = [];
 		for (const zone of zones) {
-			const { result: records } = await cloudflare.dns.records.list({
+			const { result: existing } = await cloudflare.dns.records.list({
 				zone_id: zone.id,
-				name: newRecord.name as Cloudflare.DNS.Records.RecordListParams.Name,
-				type: newRecord.type,
+				name: record.name as Cloudflare.DNS.Records.RecordListParams.Name,
+				type: record.type,
 			});
 			matches.push(
-				...records.filter((rec) => rec.id).map((rec) => ({ record: rec as AddressableRecord & { id: string }, zoneId: zone.id })),
+				...existing
+					.filter((rec) => rec.id)
+					.map((rec) => ({
+						id: rec.id,
+						content: rec.content,
+						// The SDK types mark proxied/ttl required, but the live API
+						// can omit them; default at the boundary.
+						proxied: rec.proxied ?? false,
+						comment: rec.comment,
+						ttl: rec.ttl ?? 1,
+						zoneId: zone.id,
+					})),
 			);
 		}
 
 		const match = matches[0];
 		if (match === undefined) {
-			throw new HttpError(400, `No matching record found for '${newRecord.name ?? ''}'. Create it manually first.`);
+			throw new HttpError(400, `No matching record found for '${record.name}'. Create it manually first.`);
 		}
 		if (matches.length > 1) {
-			throw new HttpError(400, `Multiple matching records found for '${newRecord.name ?? ''}'. Specify a unique hostname per zone.`);
+			throw new HttpError(400, `Multiple matching records found for '${record.name}'. Specify a unique hostname per zone.`);
 		}
 
-		const { record, zoneId } = match;
-		// The SDK types mark proxied/ttl required, but the live API can omit
-		// them; default at the boundary instead of trusting the declaration.
-		const { comment } = record;
-		const proxied = record.proxied ?? false;
-		const ttl = record.ttl ?? 1;
-		await cloudflare.dns.records.update(record.id, {
-			content: newRecord.content,
-			zone_id: zoneId,
-			name: newRecord.name,
-			type: newRecord.type,
-			proxied,
-			comment,
-			ttl,
-		});
+		// Notifications key off the actual DNS delta, never the cache: a
+		// cache miss on an unchanged record refreshes silently.
+		const changed = match.content !== record.content;
+		if (changed) {
+			await cloudflare.dns.records.update(match.id, {
+				content: record.content,
+				zone_id: match.zoneId,
+				name: record.name,
+				type: record.type,
+				proxied: match.proxied,
+				comment: match.comment,
+				ttl: match.ttl,
+			});
 
-		const successMsg = `DNS record for '${newRecord.name ?? ''}' ('${newRecord.type ?? ''}') updated to '${newRecord.content ?? ''}'`;
-		console.log(successMsg);
-		updateMessages.push(successMsg);
+			const successMsg = `DNS record for '${record.name}' ('${record.type}') updated to '${record.content}'`;
+			console.log(successMsg);
+			updateMessages.push(successMsg);
+		} else {
+			console.log(`DNS record for '${record.name}' ('${record.type}') already at '${record.content}'. Refreshing cache only.`);
+		}
+
+		await writeCachedIp(env, record);
+		results.push({ hostname: record.name, type: record.type, ip: record.content, updated: changed });
 	}
 
-	// Store the new IP address as the last known IP for this user
-	try {
-		await env.DDNS_KV.put(userKey, currentIp);
-	} catch (error) {
-		console.error(`Failed to store last known IP for user ${userEmail} to KV:`, error);
-		// Continue even if KV storage fails
-	}
-
-	// Send one grouped notification for all updates
+	// Send one grouped notification for the records that actually changed
 	await pushNtfy(updateMessages, env);
 
+	const anyUpdated = updateMessages.length > 0;
 	return jsonResponse(
 		{
 			success: true,
-			message: 'DNS records updated successfully',
+			message: anyUpdated ? 'DNS records updated successfully' : 'DNS records already current',
 			data: {
-				ip: currentIp,
-				previousIp: lastKnownIp,
-				updated: true,
-				records: newRecords.map((r) => ({ hostname: r.name, type: r.type })),
+				updated: anyUpdated,
+				records: results,
 			},
 		},
 		200,
@@ -224,8 +367,8 @@ export default {
 
 		try {
 			const clientOptions = constructClientOptions(request);
-			const record = constructDNSRecord(request);
-			return await updateHostnames(clientOptions, record, env);
+			const updateRequest = constructDNSRecords(request);
+			return await updateHostnames(clientOptions, updateRequest, env);
 		} catch (err: unknown) {
 			const isHttpError = err instanceof HttpError;
 			const message = isHttpError ? err.message : 'Internal Server Error';

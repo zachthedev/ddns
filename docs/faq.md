@@ -11,9 +11,10 @@ The server configuration depends on your UniFi device model:
   - **Note:** Do **not** include the path with variables.
 
 - **Newer Gateways (e.g., UDM series, UXG series):**
-  - **Server:** `<worker-name>.<worker-subdomain>.workers.dev/update?ip=%i&hostname=%h`
+  - **Server:** `<worker-name>.<worker-subdomain>.workers.dev/update?ip4=%i&ip6=auto&hostnames=%h`
   - **Note:** Include the full path with variables. Multiple hostnames are
     supported as a comma-separated list, e.g. `hostnames=example.com,*.example.com`.
+    Drop `ip6=auto` if you have no IPv6.
 
 This distinction is crucial to ensure the DDNS updates function correctly.
 
@@ -25,8 +26,8 @@ This distinction is crucial to ensure the DDNS updates function correctly.
 2. **Create New Dynamic DNS Entry:**
    - **Service:** Select `custom`.
    - **Hostname:** Enter your desired hostname (e.g., `subdomain.example.com`).
-   - **Username:** Enter your Cloudflare account email.
-   - **Password:** Enter your Cloudflare API token.
+   - **Username:** Any value; the field is ignored.
+   - **Password:** Enter your DNS-scoped Cloudflare API token.
    - **Server:** Enter the appropriate server address based on your device model (see FAQ #1).
 
 3. **Save Configuration:**
@@ -106,9 +107,9 @@ Assign separate DDNS providers to each WAN interface if supported. Using the `cu
 
 ## 11. How can I use Unifi devices behind NAT?
 
-In case the Unifi router is deployed behind a NAT gateway (e.g. cable modem in router mode, 5G modem or similar), it will likely get a non-routable RFC 1918 address assigned on the external interface. In this case, the Unifi router would incorrectly update DNS to the non-routable external IP address via `ip=%i`.
+In case the Unifi router is deployed behind a NAT gateway (e.g. cable modem in router mode, 5G modem or similar), it will likely get a non-routable RFC 1918 address assigned on the external interface. In this case, the Unifi router would incorrectly update DNS to the non-routable external IP address via `ip4=%i`.
 
-To support scenarios where such a router needs to be externally available (e.g. via port forwarding on the NAT gateway), you can use `ip=auto` instead of `ip=%i` to have the Cloudflare worker automatically determine the Unifi router's NATed IP address and use it for correctly updating the hostname's `A` record.
+To support scenarios where such a router needs to be externally available (e.g. via port forwarding on the NAT gateway), you can use `ip4=auto` instead of `ip4=%i` to have the Cloudflare worker automatically determine the Unifi router's NATed IP address and use it for correctly updating the hostname's `A` record. The same applies to `ip6=auto` for AAAA records.
 
 ## 12. What should I do if I continue to experience issues with DDNS updates?
 
