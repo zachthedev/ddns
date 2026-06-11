@@ -10,13 +10,13 @@ instead of this repository.
 - Every gh command that creates or modifies something visible to others
   (`pr create`, `pr close`, `pr comment`, `issue create`, `issue comment`,
   `release create`, `repo edit`, label or milestone changes) must carry an
-  explicit `--repo zachthedev/ddns`. Never rely on default resolution for
+  explicit `--repo zachthedev/uddns`. Never rely on default resolution for
   these commands.
 - `gh pr create` additionally requires explicit `--base` and `--head`
   branches, even when `--repo` is present.
 - Read-only gh commands (`pr view`, `pr checks`, `run view`, `api` GETs) may
   omit `--repo` only after `gh repo set-default` has been confirmed to point
-  at zachthedev/ddns in the current clone (`gh repo set-default --view`).
+  at zachthedev/uddns in the current clone (`gh repo set-default --view`).
 - Anything aimed at the upstream repository (PRs, issues, comments on
   willswire/unifi-ddns) happens only on an explicit request that names the
   upstream; the request being about "the repo" always means this fork.
