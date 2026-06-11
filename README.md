@@ -113,7 +113,7 @@ The worker is built to take heavy public traffic cheaply:
 
 - **Steady-state polling is API-free.** With the access key configured, a request whose records all match the KV cache answers with zero Cloudflare API calls: one worker invocation, one rate-limit check, and one KV read per record. A device polling every 2 minutes costs ~22k invocations and ~44k KV reads per month per record pair, far inside the Workers paid plan's included 10M requests and 10M KV reads.
 - **Cache misses stay lean.** Token verification and the zone list (cached per token for 5 minutes) front a parallel record lookup; only records whose DNS content actually differs trigger an update call. Audit writes and notifications ride `ctx.waitUntil` after the response.
-- **Strangers are throttled at the edge.** The rate limiter (50 requests/minute per IP, per colo) returns 429 before authentication runs, and an unauthenticated or wrong-key request never reaches the Cloudflare API, KV, or D1.
+- **Strangers are throttled at the edge.** The rate limiter (50 requests/minute per IP, per colo) returns 429 before authentication runs, and an unauthenticated or wrong-key request never reaches the Cloudflare API, KV, or D1. Enforcement is Cloudflare's best-effort, eventually-consistent counter, a cost cap against sustained abuse rather than a precise gate; short bursts can overshoot.
 - **Ballpark beyond included quotas** (Workers paid plan pricing): ~$0.30 per additional 1M requests, ~$0.50 per additional 1M KV reads; D1 audit volume is negligible by design (rows only on actual DNS-touching events).
 
 ## 🛠️ **Testing & Troubleshooting**
