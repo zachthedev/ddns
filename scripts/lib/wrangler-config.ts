@@ -14,12 +14,18 @@ export interface D1DatabaseConfig {
 	migrations_dir?: string;
 }
 
+export interface RouteConfig {
+	pattern: string;
+	custom_domain: boolean;
+}
+
 export interface WranglerConfig {
 	[key: string]: unknown;
 	name?: string;
 	account_id?: string;
 	kv_namespaces?: KVNamespaceConfig[];
 	d1_databases?: D1DatabaseConfig[];
+	routes?: RouteConfig[];
 }
 
 /** Repository root, derived from this file's location. */
@@ -37,6 +43,7 @@ export const ENV_KEYS = {
 	kvId: 'KV_NAMESPACE_ID',
 	kvPreviewId: 'KV_NAMESPACE_PREVIEW_ID',
 	d1Id: 'D1_DATABASE_ID',
+	customDomain: 'CUSTOM_DOMAIN',
 	accessKey: 'ACCESS_KEY',
 	// Read natively by wrangler; never stored in config files.
 	accountId: 'CLOUDFLARE_ACCOUNT_ID',

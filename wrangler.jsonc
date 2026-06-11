@@ -5,14 +5,11 @@
 	"compatibility_date": "2026-06-01",
 	"compatibility_flags": ["nodejs_compat"],
 
-	// Client-facing endpoint. Declared in config so the custom domain is
-	// reproducible rather than dashboard-only.
-	"routes": [
-		{
-			"pattern": "ddns.quist.network",
-			"custom_domain": true,
-		},
-	],
+	// No custom domain is hardcoded here: it is deployment-specific (you'd
+	// use your own domain, not anyone else's). Set CUSTOM_DOMAIN in your
+	// environment and `bun run deploy` injects it as a custom_domain route.
+	// Without it, the worker is reachable at its <name>.<subdomain>.workers.dev
+	// URL, and you can attach a domain in the Cloudflare dashboard.
 
 	// account_id is intentionally absent: wrangler reads CLOUDFLARE_ACCOUNT_ID
 	// from the environment (GitHub Actions secret in CI, .env.local locally).
