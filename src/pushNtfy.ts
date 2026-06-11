@@ -1,8 +1,11 @@
-export async function pushNtfy(messages: string | string[], env: Env): Promise<void> {
-	// The ntfy integration is optional; without the secret, updates proceed
-	// silently instead of failing after the DNS write.
-	if (!env.NTFY_URL) {
-		console.log('NTFY_URL not configured; skipping notification.');
+/**
+ * Sends a change notification to an ntfy server. The target comes entirely
+ * from the request's `ntfy` parameter (validated upstream); deployments hold
+ * no notification configuration, which keeps the worker multi-tenant: every
+ * caller gets their own topic, self-hosted servers included.
+ */
+export async function pushNtfy(messages: string | string[], ntfyUrl: string | null): Promise<void> {
+	if (ntfyUrl === null || ntfyUrl === '') {
 		return;
 	}
 
@@ -25,7 +28,7 @@ export async function pushNtfy(messages: string | string[], env: Env): Promise<v
 	}
 
 	try {
-		await fetch(env.NTFY_URL, {
+		await fetch(ntfyUrl, {
 			method: 'POST',
 			body: message,
 			headers: { 'Content-Type': 'text/plain' },

@@ -13,7 +13,7 @@ If you're new, we encourage you to take a look at issues that have been previous
 
 1. Create a GitHub issue proposing a new feature.
 2. Fork the repo and create your branch from `main`.
-3. If you've added code that should be tested, add tests to `test/index.spec.ts`.
+3. If you've added code that should be tested, add tests under `tests/` (`tests/index.test.ts` for worker behavior).
 4. Update the `README.md` and/or `docs/faq.md` where appropriate.
 5. Ensure your test passes locally.
 6. Address any feedback in code review promptly.

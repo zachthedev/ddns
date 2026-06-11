@@ -13,7 +13,12 @@ the Cloudflare Workers pool, ESLint + prettier, lefthook hooks.
 
 Cloudflare resource naming: `<type>-<project>-<purpose>-<env>`, e.g.
 `kv-uddns-cache-prod`, `kv-uddns-cache-dev`, `d1-uddns-audit-prod`. Binding
-names in code stay short (`DDNS_KV`). Workers themselves: `<project>-<env>`.
+names in code stay short (`DDNS_KV`, `AUDIT_DB`). The D1 name comes from
+wrangler.jsonc and follows the convention automatically; KV namespaces
+created by `bun run setup` get wrangler's default titles, and the
+convention-named titles are applied by renaming in the dashboard (titles are
+cosmetic; IDs and bindings are what matter). The production worker is
+currently named `ddns` (becomes `uddns-prod` in the rename).
 
 Rules:
 

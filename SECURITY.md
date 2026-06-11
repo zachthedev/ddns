@@ -19,7 +19,7 @@ We take security vulnerabilities seriously and appreciate your efforts to disclo
 
 ### **How to Report:**
 
-- Please report any security vulnerabilities via **[hey@willswire.com](mailto:hey@willswire.com)**.
+- Please report any security vulnerabilities privately via [GitHub Security Advisories](https://github.com/zachthedev/ddns/security/advisories/new).
 - Include as much detail as possible, such as steps to reproduce, potential impact, and any relevant logs or information.
 
 ### **What to Expect:**

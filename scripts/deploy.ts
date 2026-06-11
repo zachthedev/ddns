@@ -7,10 +7,11 @@ import { CONFIG_PATHS, ENV_KEYS, OPTIONAL_WORKER_SECRETS, loadConfig, serializeC
  * Single deploy path for local machines and CI.
  *
  * Generates wrangler.deploy.jsonc from the committed wrangler.jsonc with real
- * KV namespace IDs injected from the environment (GitHub Actions secrets in
- * CI; bun auto-loads .env.local locally), runs `wrangler deploy` against the
- * generated file, and syncs the NTFY_URL worker secret when present in the
- * environment. The committed config never holds real IDs.
+ * KV and D1 IDs injected from the environment (GitHub Actions secrets in CI;
+ * bun auto-loads .env.local locally), applies D1 migrations, runs
+ * `wrangler deploy` against the generated file, and syncs the optional
+ * worker secrets (ACCESS_KEY) when present in the environment. The committed
+ * config never holds real IDs.
  *
  * Flags:
  *   --generate-only   write wrangler.deploy.jsonc and exit (placeholders pass

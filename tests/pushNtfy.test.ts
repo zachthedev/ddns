@@ -1,12 +1,10 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { pushNtfy } from '../src/pushNtfy';
-import { createMockEnv } from './helpers/mocks';
+
+const DEFAULT_NTFY_URL = 'https://ntfy.example.com/test-topic';
 
 describe('pushNtfy', () => {
-	let env: Env;
-
 	beforeEach(() => {
-		env = createMockEnv();
 		vi.spyOn(console, 'error').mockImplementation(() => {});
 		vi.spyOn(console, 'log').mockImplementation(() => {});
 		vi.stubGlobal('fetch', vi.fn());
@@ -18,25 +16,22 @@ describe('pushNtfy', () => {
 	});
 
 	// -------------------------------------------------------------------------
-	// Environment validation
+	// URL validation  (null / empty guard)
 	// -------------------------------------------------------------------------
 
-	describe('Environment validation', () => {
-		it('skips notification when NTFY_URL is empty', async () => {
-			env.NTFY_URL = '';
+	describe('URL validation', () => {
+		it('skips notification when ntfyUrl is null', async () => {
 			const mockFetch = vi.mocked(fetch);
 
-			await expect(pushNtfy('test message', env)).resolves.toBeUndefined();
+			await expect(pushNtfy('test message', null)).resolves.toBeUndefined();
 
 			expect(mockFetch).not.toHaveBeenCalled();
 		});
 
-		it('skips notification when NTFY_URL is undefined', async () => {
-			// @ts-expect-error - Testing undefined scenario
-			delete env.NTFY_URL;
+		it('skips notification when ntfyUrl is an empty string', async () => {
 			const mockFetch = vi.mocked(fetch);
 
-			await expect(pushNtfy('test message', env)).resolves.toBeUndefined();
+			await expect(pushNtfy('test message', '')).resolves.toBeUndefined();
 
 			expect(mockFetch).not.toHaveBeenCalled();
 		});
@@ -51,9 +46,9 @@ describe('pushNtfy', () => {
 			const mockFetch = vi.mocked(fetch);
 			mockFetch.mockResolvedValueOnce(new Response('OK'));
 
-			await pushNtfy('Single notification message', env);
+			await pushNtfy('Single notification message', DEFAULT_NTFY_URL);
 
-			expect(mockFetch).toHaveBeenCalledWith(env.NTFY_URL, {
+			expect(mockFetch).toHaveBeenCalledWith(DEFAULT_NTFY_URL, {
 				method: 'POST',
 				body: 'Single notification message',
 				headers: { 'Content-Type': 'text/plain' },
@@ -66,9 +61,9 @@ describe('pushNtfy', () => {
 			const mockFetch = vi.mocked(fetch);
 			mockFetch.mockResolvedValueOnce(new Response('OK'));
 
-			await pushNtfy(['Single message in array'], env);
+			await pushNtfy(['Single message in array'], DEFAULT_NTFY_URL);
 
-			expect(mockFetch).toHaveBeenCalledWith(env.NTFY_URL, {
+			expect(mockFetch).toHaveBeenCalledWith(DEFAULT_NTFY_URL, {
 				method: 'POST',
 				body: 'Single message in array',
 				headers: { 'Content-Type': 'text/plain' },
@@ -83,13 +78,13 @@ describe('pushNtfy', () => {
 
 			const messages = ['First update', 'Second update'];
 
-			await pushNtfy(messages, env);
+			await pushNtfy(messages, DEFAULT_NTFY_URL);
 
 			const expectedBody = `DNS Records Updated:
 • First update
 • Second update`;
 
-			expect(mockFetch).toHaveBeenCalledWith(env.NTFY_URL, {
+			expect(mockFetch).toHaveBeenCalledWith(DEFAULT_NTFY_URL, {
 				method: 'POST',
 				body: expectedBody,
 				headers: { 'Content-Type': 'text/plain' },
@@ -104,14 +99,14 @@ describe('pushNtfy', () => {
 
 			const messages = ['First DNS update', 'Second DNS update', 'Third DNS update'];
 
-			await pushNtfy(messages, env);
+			await pushNtfy(messages, DEFAULT_NTFY_URL);
 
 			const expectedBody = `DNS Records Updated:
 • First DNS update
 • Second DNS update
 • Third DNS update`;
 
-			expect(mockFetch).toHaveBeenCalledWith(env.NTFY_URL, {
+			expect(mockFetch).toHaveBeenCalledWith(DEFAULT_NTFY_URL, {
 				method: 'POST',
 				body: expectedBody,
 				headers: { 'Content-Type': 'text/plain' },
@@ -123,7 +118,7 @@ describe('pushNtfy', () => {
 		it('skips notification for an empty array', async () => {
 			const mockFetch = vi.mocked(fetch);
 
-			await pushNtfy([], env);
+			await pushNtfy([], DEFAULT_NTFY_URL);
 
 			expect(mockFetch).not.toHaveBeenCalled();
 		});
@@ -132,7 +127,7 @@ describe('pushNtfy', () => {
 			const mockFetch = vi.mocked(fetch);
 
 			// @ts-expect-error - Testing undefined scenario
-			await pushNtfy([undefined], env);
+			await pushNtfy([undefined], DEFAULT_NTFY_URL);
 
 			expect(mockFetch).not.toHaveBeenCalled();
 		});
@@ -147,7 +142,7 @@ describe('pushNtfy', () => {
 			const mockFetch = vi.mocked(fetch);
 			mockFetch.mockRejectedValueOnce(new Error('Network error'));
 
-			await expect(pushNtfy('Test message', env)).resolves.not.toThrow();
+			await expect(pushNtfy('Test message', DEFAULT_NTFY_URL)).resolves.not.toThrow();
 
 			expect(mockFetch).toHaveBeenCalledTimes(1);
 		});
@@ -156,7 +151,7 @@ describe('pushNtfy', () => {
 			const mockFetch = vi.mocked(fetch);
 			mockFetch.mockRejectedValueOnce(new Error('Request timeout'));
 
-			await expect(pushNtfy('Test message', env)).resolves.not.toThrow();
+			await expect(pushNtfy('Test message', DEFAULT_NTFY_URL)).resolves.not.toThrow();
 
 			expect(mockFetch).toHaveBeenCalledTimes(1);
 		});
@@ -170,7 +165,7 @@ describe('pushNtfy', () => {
 				}),
 			);
 
-			await expect(pushNtfy('Test message', env)).resolves.not.toThrow();
+			await expect(pushNtfy('Test message', DEFAULT_NTFY_URL)).resolves.not.toThrow();
 
 			expect(mockFetch).toHaveBeenCalledTimes(1);
 		});
@@ -181,7 +176,7 @@ describe('pushNtfy', () => {
 	// -------------------------------------------------------------------------
 
 	describe('Integration scenarios', () => {
-		it('sends notification to the configured NTFY_URL', async () => {
+		it('sends notification to the configured ntfyUrl', async () => {
 			const mockFetch = vi.mocked(fetch);
 			mockFetch.mockResolvedValueOnce(
 				new Response('Message sent', {
@@ -190,9 +185,9 @@ describe('pushNtfy', () => {
 				}),
 			);
 
-			await pushNtfy('Integration test message', env);
+			await pushNtfy('Integration test message', DEFAULT_NTFY_URL);
 
-			expect(mockFetch).toHaveBeenCalledWith('https://ntfy.example.com/test-topic', {
+			expect(mockFetch).toHaveBeenCalledWith(DEFAULT_NTFY_URL, {
 				method: 'POST',
 				body: 'Integration test message',
 				headers: { 'Content-Type': 'text/plain' },
@@ -200,15 +195,15 @@ describe('pushNtfy', () => {
 			});
 		});
 
-		it('sends notification to a custom NTFY_URL', async () => {
+		it('sends notification to a custom ntfyUrl', async () => {
 			const mockFetch = vi.mocked(fetch);
 			mockFetch.mockResolvedValueOnce(new Response('OK'));
 
-			env.NTFY_URL = 'https://custom.ntfy.server/my-topic';
+			const customUrl = 'https://custom.ntfy.server/my-topic';
 
-			await pushNtfy('Custom server test', env);
+			await pushNtfy('Custom server test', customUrl);
 
-			expect(mockFetch).toHaveBeenCalledWith('https://custom.ntfy.server/my-topic', {
+			expect(mockFetch).toHaveBeenCalledWith(customUrl, {
 				method: 'POST',
 				body: 'Custom server test',
 				headers: { 'Content-Type': 'text/plain' },

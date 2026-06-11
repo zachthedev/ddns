@@ -30,7 +30,6 @@ export const CONFIG_PATHS = {
 	source: join(REPO_ROOT, 'wrangler.jsonc'),
 	deploy: join(REPO_ROOT, 'wrangler.deploy.jsonc'),
 	envLocal: join(REPO_ROOT, '.env.local'),
-	devVars: join(REPO_ROOT, '.dev.vars'),
 } as const;
 
 /** Environment variable names shared by setup, deploy, and CI secrets. */
@@ -38,14 +37,13 @@ export const ENV_KEYS = {
 	kvId: 'KV_NAMESPACE_ID',
 	kvPreviewId: 'KV_NAMESPACE_PREVIEW_ID',
 	d1Id: 'D1_DATABASE_ID',
-	ntfyUrl: 'NTFY_URL',
 	accessKey: 'ACCESS_KEY',
 	// Read natively by wrangler; never stored in config files.
 	accountId: 'CLOUDFLARE_ACCOUNT_ID',
 } as const;
 
 /** Worker secrets that deploy syncs when present in the environment. */
-export const OPTIONAL_WORKER_SECRETS = [ENV_KEYS.ntfyUrl, ENV_KEYS.accessKey] as const;
+export const OPTIONAL_WORKER_SECRETS = [ENV_KEYS.accessKey] as const;
 
 /** Cloudflare account and KV namespace IDs are 32 hex characters. */
 export const HEX_ID_PATTERN = /\b[0-9a-f]{32}\b/g;

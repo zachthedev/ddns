@@ -82,12 +82,6 @@ async function main(): Promise<void> {
 	const d1Id = extractFirst(UUID_PATTERN, d1Out, d1.database_name);
 	console.log(`  database: ${d1Id}`);
 
-	const ntfy = prompt('ntfy topic URL for change notifications (blank to skip):')?.trim() ?? '';
-	if (ntfy !== '') {
-		await Bun.write(CONFIG_PATHS.devVars, `${ENV_KEYS.ntfyUrl}="${ntfy}"\n`);
-		console.log('.dev.vars written for local dev.');
-	}
-
 	// Locking the worker to your own devices: the key rides in the UniFi
 	// Username field (or X-Access-Key header) and is checked before any
 	// Cloudflare API call.
@@ -105,7 +99,6 @@ async function main(): Promise<void> {
 		`${ENV_KEYS.kvId}=${kvId}`,
 		`${ENV_KEYS.kvPreviewId}=${kvPreviewId}`,
 		`${ENV_KEYS.d1Id}=${d1Id}`,
-		...(ntfy !== '' ? [`${ENV_KEYS.ntfyUrl}=${ntfy}`] : []),
 		...(accessKey !== '' ? [`${ENV_KEYS.accessKey}=${accessKey}`] : []),
 		'',
 	];
@@ -122,8 +115,9 @@ async function main(): Promise<void> {
 	console.log('\nSetup complete. Next steps:');
 	console.log('  - bun run deploy            (deploy from this machine; also syncs secrets)');
 	console.log(`  - add ${ENV_KEYS.kvId}, ${ENV_KEYS.kvPreviewId}, ${ENV_KEYS.d1Id}, CLOUDFLARE_API_TOKEN,`);
-	console.log(`    CLOUDFLARE_ACCOUNT_ID (and optionally ${ENV_KEYS.ntfyUrl}, ${ENV_KEYS.accessKey}) as`);
-	console.log('    GitHub Actions secrets to deploy on every push to main.');
+	console.log(`    CLOUDFLARE_ACCOUNT_ID (and optionally ${ENV_KEYS.accessKey}) as GitHub Actions`);
+	console.log('    secrets to deploy on every push to main.');
+	console.log('  - notifications: append &ntfy=https://ntfy.sh/<topic> to your update URL (raw, not percent-encoded).');
 }
 
 await main();

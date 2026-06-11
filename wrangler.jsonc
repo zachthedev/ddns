@@ -8,7 +8,7 @@
 	// account_id is intentionally absent: wrangler reads CLOUDFLARE_ACCOUNT_ID
 	// from the environment (GitHub Actions secret in CI, .env.local locally).
 
-	// KV namespace for storing the last known IP address per user.
+	// KV namespace caching the last known IP address per record.
 	// The placeholder IDs below are never replaced in this file; deploys go
 	// through `bun run deploy`, which generates wrangler.deploy.jsonc with the
 	// real IDs from the environment. Local `wrangler dev` simulates KV and
@@ -30,6 +30,19 @@
 			"database_name": "d1-uddns-audit-prod",
 			"database_id": "REPLACE_WITH_YOUR_D1_DATABASE_ID",
 			"migrations_dir": "migrations",
+		},
+	],
+
+	// Edge-local request throttle per caller IP. Best-effort (per-colo), which
+	// is exactly right for capping invocation abuse on a public endpoint.
+	"ratelimits": [
+		{
+			"name": "RATE_LIMITER",
+			"namespace_id": "1001",
+			"simple": {
+				"limit": 50,
+				"period": 60,
+			},
 		},
 	],
 
