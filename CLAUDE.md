@@ -20,7 +20,3 @@ created by `bun run setup` get wrangler's default titles, and the
 convention-named titles are applied by renaming in the dashboard (titles are
 cosmetic; IDs and bindings are what matter). The production worker is named
 `uddns` and is served at the custom domain `ddns.quist.network`.
-
-Rules:
-
-@.claude/rules/github-cli.md
