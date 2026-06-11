@@ -115,28 +115,69 @@ function constructClientOptions(request: Request): ClientOptions {
 	return { apiToken: token };
 }
 
-function constructDNSRecords(request: Request): UpdateRequest {
-	const { searchParams } = new URL(request.url);
-	let ip = (searchParams.get('ip') ?? searchParams.get('myip'))?.trim() ?? null;
-	const ip6 = searchParams.get('ip6')?.trim() ?? null;
-	const hostnameParam = (searchParams.get('hostnames') ?? searchParams.get('hostname'))?.trim() ?? null;
-	const zoneFilter = searchParams.get('zone')?.trim() ?? null;
+interface ResolvedIps {
+	v4: string | null;
+	v6: string | null;
+}
 
-	if (ip === null || ip === '') {
-		throw new HttpError(422, "Missing 'ip' parameter. Use ip=auto to use the client IP.");
-	} else if (ip === 'auto') {
-		ip = request.headers.get('CF-Connecting-IP');
-		if (ip === null || ip === '') {
-			throw new HttpError(500, 'ip=auto specified but client IP could not be determined.');
+/**
+ * Resolves the requested IPs from the ip4/ip6 parameters.
+ *
+ * Literals are validated against their address family. `auto` takes the
+ * connecting IP only when it matches the slot's family and silently skips
+ * the slot otherwise: dual-stack callers (UniFi may dial over either
+ * family) can request both without flapping.
+ */
+function resolveIps(searchParams: URLSearchParams, request: Request): ResolvedIps {
+	const raw4 = searchParams.get('ip4')?.trim() ?? null;
+	const raw6 = searchParams.get('ip6')?.trim() ?? null;
+	const connectingIp = request.headers.get('CF-Connecting-IP');
+
+	let v4: string | null = null;
+	if (raw4 !== null && raw4 !== '') {
+		if (raw4 === 'auto') {
+			if (connectingIp?.includes('.')) {
+				v4 = connectingIp;
+			} else {
+				console.log('ip4=auto requested but the client did not connect over IPv4; skipping A records.');
+			}
+		} else if (!raw4.includes('.')) {
+			throw new HttpError(422, "The 'ip4' parameter must be a valid IPv4 address.");
+		} else {
+			v4 = raw4;
 		}
 	}
 
-	if (ip6 !== null && ip6 !== '' && !ip6.includes(':')) {
-		throw new HttpError(422, "The 'ip6' parameter must be a valid IPv6 address.");
+	let v6: string | null = null;
+	if (raw6 !== null && raw6 !== '') {
+		if (raw6 === 'auto') {
+			if (connectingIp?.includes(':')) {
+				v6 = connectingIp;
+			} else {
+				console.log('ip6=auto requested but the client did not connect over IPv6; skipping AAAA records.');
+			}
+		} else if (!raw6.includes(':')) {
+			throw new HttpError(422, "The 'ip6' parameter must be a valid IPv6 address.");
+		} else {
+			v6 = raw6;
+		}
 	}
 
+	if (v4 === null && v6 === null) {
+		throw new HttpError(422, "Missing IP. Provide 'ip4' and/or 'ip6'; 'auto' uses the client IP.");
+	}
+
+	return { v4, v6 };
+}
+
+function constructDNSRecords(request: Request): UpdateRequest {
+	const { searchParams } = new URL(request.url);
+	const { v4, v6 } = resolveIps(searchParams, request);
+	const hostnameParam = searchParams.get('hostnames')?.trim() ?? null;
+	const zoneFilter = searchParams.get('zone')?.trim() ?? null;
+
 	if (hostnameParam === null || hostnameParam === '') {
-		throw new HttpError(422, "Missing 'hostname' parameter.");
+		throw new HttpError(422, "Missing 'hostnames' parameter.");
 	}
 	const hostnames = hostnameParam
 		.split(',')
@@ -146,23 +187,14 @@ function constructDNSRecords(request: Request): UpdateRequest {
 		throw new HttpError(422, 'No hostnames provided.');
 	}
 
-	// One record per hostname, plus an AAAA per hostname for dual-stack
-	// callers that supply ip6 alongside an IPv4 ip.
+	// Per hostname: an A record when ip4 resolved, an AAAA when ip6 did.
 	const records: DDNSRecord[] = [];
 	for (const hostname of hostnames) {
-		records.push({
-			content: ip,
-			name: hostname,
-			type: ip.includes('.') ? 'A' : 'AAAA',
-			ttl: 1,
-		});
-		if (ip6 !== null && ip6 !== '') {
-			records.push({
-				content: ip6,
-				name: hostname,
-				type: 'AAAA',
-				ttl: 1,
-			});
+		if (v4 !== null) {
+			records.push({ content: v4, name: hostname, type: 'A', ttl: 1 });
+		}
+		if (v6 !== null) {
+			records.push({ content: v6, name: hostname, type: 'AAAA', ttl: 1 });
 		}
 	}
 

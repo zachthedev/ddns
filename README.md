@@ -27,7 +27,7 @@ This worker exists for what the native client doesn't do:
 - **Push notifications** via [ntfy](https://ntfy.sh) when your IP actually changes
 - **Multi-hostname updates** in a single entry (comma-separated), including across multiple zones
 - **Record preservation**: proxy status, TTL, and comments on existing records survive updates
-- **`ip=auto`** for routers behind NAT that would otherwise report a private IP
+- **`ip4=auto` / `ip6=auto`** for routers behind NAT that would otherwise report a private IP
 - **Audit history** of DNS changes for compliance
 
 ## 🚀 **Setup Overview**
@@ -95,8 +95,8 @@ injected at deploy time from the environment.
    - **Hostname:** `subdomain.example.com` or `example.com`
    - **Username:** Any value (the field is ignored; the API token does the authenticating)
    - **Password:** Cloudflare User API Token scoped to DNS edit _(not an Account API Token)_
-   - **Server:** `<worker-name>.<worker-subdomain>.workers.dev/update?ip=%i&hostname=%h`
-     _(Omit `https://`. To update several records at once, use a comma-separated list: `hostnames=example.com,*.example.com`. Optional parameters: `ip6=<address>` updates AAAA records alongside, `zone=example.com` restricts matching to one zone.)_
+   - **Server:** `<worker-name>.<worker-subdomain>.workers.dev/update?ip4=%i&ip6=auto&hostnames=%h`
+     _(Omit `https://`. Comma-separate to update several records at once: `hostnames=example.com,*.example.com`. `ip4`/`ip6` each accept a literal address or `auto`, which uses the connecting IP when it matches that family and skips the slot otherwise; provide at least one. Optional `zone=example.com` restricts matching to one zone.)_
 
 ## 🛠️ **Testing & Troubleshooting**
 
