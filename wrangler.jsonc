@@ -52,9 +52,8 @@
 		"enabled": true,
 	},
 
-	// Automatically place workloads in an optimal location to minimize latency.
-	// Docs: https://developers.cloudflare.com/workers/configuration/smart-placement/
-	"placement": {
-		"mode": "smart",
-	},
+	// Deliberately NO smart placement: the hot path (gated cache hit) is
+	// KV-only and belongs at the ingress colo, and the rate limiter's
+	// per-machine counters only cohere when execution stays there. Only rare
+	// cache-miss paths talk to the Cloudflare API.
 }
