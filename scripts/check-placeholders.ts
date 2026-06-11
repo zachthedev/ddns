@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 import { basename } from 'node:path';
-import { CONFIG_PATHS, HEX_ID_PATTERN } from './lib/wrangler-config';
+import { CONFIG_PATHS, HEX_ID_PATTERN, UUID_PATTERN } from './lib/wrangler-config';
 
 /**
  * Guard against committing real Cloudflare identifiers in wrangler.jsonc.
@@ -12,9 +12,9 @@ import { CONFIG_PATHS, HEX_ID_PATTERN } from './lib/wrangler-config';
  * arguments the hook passes; the target is always the committed config.
  */
 const content: string = await Bun.file(CONFIG_PATHS.source).text();
-const matches = content.match(HEX_ID_PATTERN);
+const matches = [...(content.match(HEX_ID_PATTERN) ?? []), ...(content.match(UUID_PATTERN) ?? [])];
 
-if (matches !== null && matches.length > 0) {
+if (matches.length > 0) {
 	console.error(`${basename(CONFIG_PATHS.source)} contains what looks like real Cloudflare IDs:`);
 	for (const match of matches) {
 		console.error(`  ${match.slice(0, 8)}…`);

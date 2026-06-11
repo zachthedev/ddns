@@ -17,6 +17,8 @@ This is a fork from [willswire](https://github.com/willswire/unifi-ddns) with th
 - **Multi-zone support** - API tokens can manage DNS records across multiple zones, with optional `zone=` scoping
 - **Dual-stack support** - Update A and AAAA records together with the `ip6` parameter
 - **Token-only auth** - DNS-scoped API tokens; no account email anywhere
+- **Audit history** - Every DNS change recorded in D1, queryable at `GET /history`, scoped to your own token
+- **Access key lockdown** - Optional `ACCESS_KEY` secret locks the worker to your devices, checked before any API call
 
 ## Why Use This?
 
@@ -28,7 +30,7 @@ This worker exists for what the native client doesn't do:
 - **Multi-hostname updates** in a single entry (comma-separated), including across multiple zones
 - **Record preservation**: proxy status, TTL, and comments on existing records survive updates
 - **`ip4=auto` / `ip6=auto`** for routers behind NAT that would otherwise report a private IP
-- **Audit history** of DNS changes for compliance
+- **Audit history** of DNS changes for compliance, queryable per token at `GET /history`
 
 ## 🚀 **Setup Overview**
 
@@ -93,10 +95,21 @@ injected at deploy time from the environment.
 3. Create New Dynamic DNS with the following information:
    - **Service:** `custom`
    - **Hostname:** `subdomain.example.com` or `example.com`
-   - **Username:** Any value (the field is ignored; the API token does the authenticating)
+   - **Username:** Your `ACCESS_KEY` if you configured one (recommended); any value otherwise (the field is never used for authentication)
    - **Password:** Cloudflare User API Token scoped to DNS edit _(not an Account API Token)_
    - **Server:** `<worker-name>.<worker-subdomain>.workers.dev/update?ip4=%i&ip6=auto&hostnames=%h`
      _(Omit `https://`. Comma-separate to update several records at once: `hostnames=example.com,*.example.com`. `ip4`/`ip6` each accept a literal address or `auto`, which uses the connecting IP when it matches that family and skips the slot otherwise; provide at least one. Optional `zone=example.com` restricts matching to one zone.)_
+
+## 📜 **Audit History**
+
+Every DNS change (and every no-op touch of the API) is recorded in D1 with timestamp, hostname, record type, previous and new IP, caller IP, and outcome. Query your own history (scoped to the API token you authenticate with):
+
+```sh
+curl -H "Authorization: Bearer <api-token>" -H "X-Access-Key: <access-key-if-set>" \
+  "https://<worker-url>/history?limit=50&hostname=example.com"
+```
+
+Cache fast-path hits are not recorded; only requests that reached the DNS API produce events.
 
 ## 🛠️ **Testing & Troubleshooting**
 

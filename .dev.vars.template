@@ -1,9 +1,12 @@
 # Local worker secrets for `bun run dev`. Copy to .dev.vars (gitignored).
-# `bun run setup` can create both this file and the production secret.
-#
-# To set the secret in production manually:
-#   bun x wrangler secret put NTFY_URL
+# `bun run setup` can create this file. Production values are synced by
+# `bun run deploy` from .env.local / GitHub Actions secrets.
 
 # Notification service URL (optional)
 # Example: https://ntfy.sh/your-unique-topic
 NTFY_URL="https://ntfy.sh/YOUR_TOPIC_HERE"
+
+# Access key locking the worker to your own devices (optional but
+# recommended). Callers present it in the UniFi Username field or an
+# X-Access-Key header. Leave empty to keep the worker open.
+ACCESS_KEY=""

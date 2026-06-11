@@ -39,12 +39,63 @@ export const createMockKVNamespace = (): KVNamespace => {
 	} as unknown as KVNamespace;
 };
 
+/**
+ * Returns a D1PreparedStatement mock whose bind() returns itself so callers
+ * can chain .bind(...).all() or pass it to batch(). The all() default returns
+ * an empty results set; override per-test via mockResolvedValue.
+ */
+export const createMockD1Statement = () => {
+	const stmt = {
+		bind: vi.fn(),
+		all: vi.fn().mockResolvedValue({ results: [] }),
+		run: vi.fn().mockResolvedValue({ success: true }),
+		first: vi.fn().mockResolvedValue(null),
+		raw: vi.fn().mockResolvedValue([]),
+	};
+	// bind() returns the same statement so chaining works
+	stmt.bind.mockReturnValue(stmt);
+	return stmt;
+};
+
+export const createMockAuditDb = () => {
+	const stmt = createMockD1Statement();
+	return {
+		prepare: vi.fn().mockReturnValue(stmt),
+		batch: vi.fn().mockResolvedValue([]),
+		exec: vi.fn().mockResolvedValue({ count: 0, duration: 0 }),
+		dump: vi.fn().mockResolvedValue(new ArrayBuffer(0)),
+	} as unknown as D1Database;
+};
+
 export const createMockEnv = (): Env => {
 	const env: Env = {
 		DDNS_KV: createMockKVNamespace(),
+		AUDIT_DB: createMockAuditDb(),
 		NTFY_URL: 'https://ntfy.example.com/test-topic',
+		ACCESS_KEY: '',
 	};
 	return env;
+};
+
+export interface MockCtx {
+	/** Passed to worker.fetch as the ExecutionContext. */
+	ctx: ExecutionContext;
+	/** Standalone mock handles for assertions (method references off the
+	 * ExecutionContext type would trip unbound-method). */
+	waitUntil: ReturnType<typeof vi.fn>;
+	passThroughOnException: ReturnType<typeof vi.fn>;
+}
+
+export const createMockCtx = (): MockCtx => {
+	const waitUntil = vi.fn();
+	const passThroughOnException = vi.fn();
+	const ctx: ExecutionContext = {
+		waitUntil,
+		passThroughOnException,
+		exports: {} as ExecutionContext['exports'],
+		props: {},
+	};
+	return { ctx, waitUntil, passThroughOnException };
 };
 
 export const createMockRequest = (
@@ -85,10 +136,10 @@ export const createBearerHeader = (rawToken: string): string => {
  * Cloudflare API responses.
  *
  * Zone id: 'zone123', record id: 'record123', hostname: 'test.example.com',
- * current content: '192.168.1.1'.
+ * current content: '192.168.1.1', token id: 'token-id-123'.
  */
 export const wireStandardHappyPath = (mockClient: ReturnType<typeof createMockCloudflareClient>): void => {
-	mockClient.user.tokens.verify.mockResolvedValue({ status: 'active' });
+	mockClient.user.tokens.verify.mockResolvedValue({ id: 'token-id-123', status: 'active' });
 	mockClient.zones.list.mockResolvedValue({
 		result: [{ id: 'zone123', name: 'example.com' }],
 	});

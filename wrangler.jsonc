@@ -21,6 +21,18 @@
 		},
 	],
 
+	// D1 database for the append-only audit trail of DNS changes.
+	// Same placeholder scheme as KV: scripts/deploy.ts injects the real ID
+	// from the environment at deploy time. Run `bun run setup` to provision.
+	"d1_databases": [
+		{
+			"binding": "AUDIT_DB",
+			"database_name": "d1-uddns-audit-prod",
+			"database_id": "REPLACE_WITH_YOUR_D1_DATABASE_ID",
+			"migrations_dir": "migrations",
+		},
+	],
+
 	// Workers Logs
 	// Docs: https://developers.cloudflare.com/workers/observability/logs/workers-logs/
 	"observability": {

@@ -7,11 +7,19 @@ export interface KVNamespaceConfig {
 	preview_id: string;
 }
 
+export interface D1DatabaseConfig {
+	binding: string;
+	database_name: string;
+	database_id: string;
+	migrations_dir?: string;
+}
+
 export interface WranglerConfig {
 	[key: string]: unknown;
 	name?: string;
 	account_id?: string;
 	kv_namespaces?: KVNamespaceConfig[];
+	d1_databases?: D1DatabaseConfig[];
 }
 
 /** Repository root, derived from this file's location. */
@@ -29,13 +37,21 @@ export const CONFIG_PATHS = {
 export const ENV_KEYS = {
 	kvId: 'KV_NAMESPACE_ID',
 	kvPreviewId: 'KV_NAMESPACE_PREVIEW_ID',
+	d1Id: 'D1_DATABASE_ID',
 	ntfyUrl: 'NTFY_URL',
+	accessKey: 'ACCESS_KEY',
 	// Read natively by wrangler; never stored in config files.
 	accountId: 'CLOUDFLARE_ACCOUNT_ID',
 } as const;
 
-/** Cloudflare account and namespace IDs are 32 hex characters. */
+/** Worker secrets that deploy syncs when present in the environment. */
+export const OPTIONAL_WORKER_SECRETS = [ENV_KEYS.ntfyUrl, ENV_KEYS.accessKey] as const;
+
+/** Cloudflare account and KV namespace IDs are 32 hex characters. */
 export const HEX_ID_PATTERN = /\b[0-9a-f]{32}\b/g;
+
+/** D1 database IDs are UUIDs. */
+export const UUID_PATTERN = /\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/g;
 
 /** Parses a JSONC config file, preserving comments for round-tripping. */
 export async function loadConfig(configPath: string = CONFIG_PATHS.source): Promise<WranglerConfig> {
