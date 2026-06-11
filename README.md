@@ -1,9 +1,9 @@
 # 🌩️ Cloudflare DDNS for UniFi OS
 
-[![CodeQL](https://github.com/zachthedev/ddns/actions/workflows/github-code-scanning/codeql/badge.svg)](https://github.com/zachthedev/ddns/actions/workflows/github-code-scanning/codeql)
-[![CI](https://github.com/zachthedev/ddns/actions/workflows/ci.yml/badge.svg)](https://github.com/zachthedev/ddns/actions/workflows/ci.yml)
-[![Dependabot Updates](https://github.com/zachthedev/ddns/actions/workflows/dependabot/dependabot-updates/badge.svg)](https://github.com/zachthedev/ddns/actions/workflows/dependabot/dependabot-updates)
-[![Deploy](https://github.com/zachthedev/ddns/actions/workflows/deploy.yml/badge.svg)](https://github.com/zachthedev/ddns/actions/workflows/deploy.yml)
+[![CodeQL](https://github.com/zachthedev/uddns/actions/workflows/github-code-scanning/codeql/badge.svg)](https://github.com/zachthedev/uddns/actions/workflows/github-code-scanning/codeql)
+[![CI](https://github.com/zachthedev/uddns/actions/workflows/ci.yml/badge.svg)](https://github.com/zachthedev/uddns/actions/workflows/ci.yml)
+[![Dependabot Updates](https://github.com/zachthedev/uddns/actions/workflows/dependabot/dependabot-updates/badge.svg)](https://github.com/zachthedev/uddns/actions/workflows/dependabot/dependabot-updates)
+[![Deploy](https://github.com/zachthedev/uddns/actions/workflows/deploy.yml/badge.svg)](https://github.com/zachthedev/uddns/actions/workflows/deploy.yml)
 
 A Cloudflare Worker that lets UniFi OS devices (UDM and UXG series) dynamically update DNS A/AAAA records on Cloudflare.
 
@@ -29,7 +29,7 @@ UniFi Network Application 9.1.92+ ships native Cloudflare DDNS support (Service:
 
 #### **Option 1: Click to Deploy**
 
-[![Deploy to Cloudflare Workers](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/zachthedev/ddns)
+[![Deploy to Cloudflare Workers](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/zachthedev/uddns)
 
 1. Click the button above.
 2. Complete the deployment.
@@ -118,7 +118,7 @@ The worker is built to take heavy public traffic cheaply:
 
 ## 🛠️ **Testing & Troubleshooting**
 
-Using this script with various Ubiquiti devices and different UniFi software versions can introduce unique challenges. If you encounter issues, start by checking the FAQ in `/docs/faq.md`. If you don’t find a solution, you can ask a question on the [discussions page](https://github.com/zachthedev/ddns/discussions/new?category=q-a). If the problem persists, please raise an issue [here](https://github.com/zachthedev/ddns/issues).
+Using this script with various Ubiquiti devices and different UniFi software versions can introduce unique challenges. If you encounter issues, start by checking the FAQ in `/docs/faq.md`. If you don’t find a solution, you can ask a question on the [discussions page](https://github.com/zachthedev/uddns/discussions/new?category=q-a). If the problem persists, please raise an issue [here](https://github.com/zachthedev/uddns/issues).
 
 ## 🙏 **Acknowledgments**
 
