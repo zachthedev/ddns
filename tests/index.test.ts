@@ -4,6 +4,7 @@ import {
 	createMockCloudflareClient,
 	createMockEnv,
 	createMockRequest,
+	createMockCtx,
 	createAuthHeader,
 	createBearerHeader,
 	wireStandardHappyPath,
@@ -41,10 +42,13 @@ describe('HttpError', () => {
 
 describe('Worker fetch handler', () => {
 	let env: Env;
+	let ctx: ExecutionContext;
+	let waitUntilMock: ReturnType<typeof vi.fn>;
 	let mockCloudflareClient: ReturnType<typeof createMockCloudflareClient>;
 
 	beforeEach(() => {
 		env = createMockEnv();
+		({ ctx, waitUntil: waitUntilMock } = createMockCtx());
 		mockCloudflareClient = createMockCloudflareClient();
 
 		vi.spyOn(console, 'log').mockImplementation(() => {});
@@ -63,19 +67,19 @@ describe('Worker fetch handler', () => {
 	});
 
 	// -------------------------------------------------------------------------
-	// Auth parsing  (constructClientOptions)
+	// Auth parsing  (parseAuthorization)
 	// -------------------------------------------------------------------------
 
 	describe('Auth parsing', () => {
 		it('accepts Basic credentials and constructs SDK with apiToken only (no apiEmail)', async () => {
-			mockCloudflareClient.user.tokens.verify.mockResolvedValue({ status: 'active' } as any);
+			mockCloudflareClient.user.tokens.verify.mockResolvedValue({ id: 'tid', status: 'active' } as any);
 			mockCloudflareClient.zones.list.mockResolvedValue({ result: [] } as any);
 
 			const request = createMockRequest('https://example.com/update?ip4=1.2.3.4&hostnames=test.example.com', {
 				headers: { Authorization: createAuthHeader('user@example.com', 'valid-token') },
 			});
 
-			const response = await worker.fetch(request, env);
+			const response = await worker.fetch(request, env, ctx);
 
 			// Fails with 'No zones available' but confirms auth passed and Cloudflare
 			// was initialised with apiToken only (username portion is discarded).
@@ -87,29 +91,29 @@ describe('Worker fetch handler', () => {
 			expect(vi.mocked(Cloudflare)).not.toHaveBeenCalledWith(expect.objectContaining({ apiEmail: expect.anything() }));
 		});
 
-		it('accepts Basic credentials with a non-email username (username is ignored)', async () => {
-			mockCloudflareClient.user.tokens.verify.mockResolvedValue({ status: 'active' } as any);
+		it('accepts Basic credentials with a non-email username (username is ignored for auth)', async () => {
+			mockCloudflareClient.user.tokens.verify.mockResolvedValue({ id: 'tid', status: 'active' } as any);
 			mockCloudflareClient.zones.list.mockResolvedValue({ result: [] } as any);
 
 			const request = createMockRequest('https://example.com/update?ip4=1.2.3.4&hostnames=test.example.com', {
 				headers: { Authorization: createAuthHeader('somedevice', 'mytoken') },
 			});
 
-			const response = await worker.fetch(request, env);
+			const response = await worker.fetch(request, env, ctx);
 
 			expect(response.status).toBe(400);
 			expect(vi.mocked(Cloudflare)).toHaveBeenCalledWith({ apiToken: 'mytoken' });
 		});
 
 		it('accepts Bearer raw-token and constructs SDK with that token directly', async () => {
-			mockCloudflareClient.user.tokens.verify.mockResolvedValue({ status: 'active' } as any);
+			mockCloudflareClient.user.tokens.verify.mockResolvedValue({ id: 'tid', status: 'active' } as any);
 			mockCloudflareClient.zones.list.mockResolvedValue({ result: [] } as any);
 
 			const request = createMockRequest('https://example.com/update?ip4=1.2.3.4&hostnames=test.example.com', {
 				headers: { Authorization: createBearerHeader('raw-api-token') },
 			});
 
-			const response = await worker.fetch(request, env);
+			const response = await worker.fetch(request, env, ctx);
 
 			expect(response.status).toBe(400);
 			expect(vi.mocked(Cloudflare)).toHaveBeenCalledWith({ apiToken: 'raw-api-token' });
@@ -118,7 +122,7 @@ describe('Worker fetch handler', () => {
 		it('rejects request without Authorization header', async () => {
 			const request = createMockRequest('https://example.com/update?ip4=1.2.3.4&hostnames=test.example.com');
 
-			const response = await worker.fetch(request, env);
+			const response = await worker.fetch(request, env, ctx);
 
 			expect(response.status).toBe(401);
 			const body = (await response.json()) as any;
@@ -133,7 +137,7 @@ describe('Worker fetch handler', () => {
 				headers: { Authorization: '' },
 			});
 
-			const response = await worker.fetch(request, env);
+			const response = await worker.fetch(request, env, ctx);
 
 			expect(response.status).toBe(401);
 			const body = (await response.json()) as any;
@@ -145,7 +149,7 @@ describe('Worker fetch handler', () => {
 				headers: { Authorization: 'Digest abc123' },
 			});
 
-			const response = await worker.fetch(request, env);
+			const response = await worker.fetch(request, env, ctx);
 
 			expect(response.status).toBe(401);
 			const body = (await response.json()) as any;
@@ -157,7 +161,7 @@ describe('Worker fetch handler', () => {
 				headers: { Authorization: 'Basic' },
 			});
 
-			const response = await worker.fetch(request, env);
+			const response = await worker.fetch(request, env, ctx);
 
 			expect(response.status).toBe(401);
 			const body = (await response.json()) as any;
@@ -169,7 +173,7 @@ describe('Worker fetch handler', () => {
 				headers: { Authorization: 'Bearer ' },
 			});
 
-			const response = await worker.fetch(request, env);
+			const response = await worker.fetch(request, env, ctx);
 
 			expect(response.status).toBe(401);
 			const body = (await response.json()) as any;
@@ -184,7 +188,7 @@ describe('Worker fetch handler', () => {
 				headers: { Authorization: 'Basic !!invalid!!base64!!' },
 			});
 
-			const response = await worker.fetch(request, env);
+			const response = await worker.fetch(request, env, ctx);
 
 			expect(response.status).toBe(401);
 			const body = (await response.json()) as any;
@@ -199,7 +203,7 @@ describe('Worker fetch handler', () => {
 				headers: { Authorization: `Basic ${btoa('nodelemiter')}` },
 			});
 
-			const response = await worker.fetch(request, env);
+			const response = await worker.fetch(request, env, ctx);
 
 			expect(response.status).toBe(401);
 			const body = (await response.json()) as any;
@@ -214,7 +218,7 @@ describe('Worker fetch handler', () => {
 				headers: { Authorization: `Basic ${btoa('user:\x00token')}` },
 			});
 
-			const response = await worker.fetch(request, env);
+			const response = await worker.fetch(request, env, ctx);
 
 			expect(response.status).toBe(401);
 			const body = (await response.json()) as any;
@@ -229,7 +233,7 @@ describe('Worker fetch handler', () => {
 				headers: { Authorization: `Basic ${btoa('user:')}` },
 			});
 
-			const response = await worker.fetch(request, env);
+			const response = await worker.fetch(request, env, ctx);
 
 			expect(response.status).toBe(401);
 			const body = (await response.json()) as any;
@@ -244,7 +248,7 @@ describe('Worker fetch handler', () => {
 				headers: { 'CF-Connecting-IP': '203.0.113.1' },
 			});
 
-			const response = await worker.fetch(request, createMockEnv());
+			const response = await worker.fetch(request, createMockEnv(), createMockCtx().ctx);
 
 			expect(response.status).toBe(401);
 		});
@@ -256,7 +260,7 @@ describe('Worker fetch handler', () => {
 				body: JSON.stringify({ test: 'data' }),
 			});
 
-			const response = await worker.fetch(request, createMockEnv());
+			const response = await worker.fetch(request, createMockEnv(), createMockCtx().ctx);
 
 			expect(response.status).toBe(401);
 		});
@@ -267,9 +271,99 @@ describe('Worker fetch handler', () => {
 				headers: { 'CF-Connecting-IP': '203.0.113.1' },
 			});
 
-			const response = await worker.fetch(request, createMockEnv());
+			const response = await worker.fetch(request, createMockEnv(), createMockCtx().ctx);
 
 			expect(response.status).toBe(401);
+		});
+	});
+
+	// -------------------------------------------------------------------------
+	// Access gate  (checkAccess)
+	// -------------------------------------------------------------------------
+
+	describe('Access gate', () => {
+		it('passes through when ACCESS_KEY is empty (open mode)', async () => {
+			env.ACCESS_KEY = '';
+			mockCloudflareClient.user.tokens.verify.mockResolvedValue({ id: 'tid', status: 'active' } as any);
+			mockCloudflareClient.zones.list.mockResolvedValue({ result: [] } as any);
+
+			const request = createMockRequest('https://example.com/update?ip4=1.2.3.4&hostnames=test.example.com', {
+				headers: { Authorization: createAuthHeader('user', 'token') },
+			});
+
+			const response = await worker.fetch(request, env, ctx);
+
+			// Fails with 'No zones available' but confirms gate did not block and
+			// tokens.verify was called (i.e. we reached the update phase).
+			expect(response.status).toBe(400);
+			expect(mockCloudflareClient.user.tokens.verify).toHaveBeenCalled();
+		});
+
+		it('allows Basic request when ACCESS_KEY matches the Basic username', async () => {
+			env.ACCESS_KEY = 'secret-key';
+			mockCloudflareClient.user.tokens.verify.mockResolvedValue({ id: 'tid', status: 'active' } as any);
+			mockCloudflareClient.zones.list.mockResolvedValue({ result: [] } as any);
+
+			const request = createMockRequest('https://example.com/update?ip4=1.2.3.4&hostnames=test.example.com', {
+				// Username = access key, token = CF api token
+				headers: { Authorization: createAuthHeader('secret-key', 'cf-token') },
+			});
+
+			const response = await worker.fetch(request, env, ctx);
+
+			// Fails with 'No zones available' — gate passed and verify was called.
+			expect(response.status).toBe(400);
+			expect(mockCloudflareClient.user.tokens.verify).toHaveBeenCalled();
+		});
+
+		it('allows Bearer request when ACCESS_KEY matches the X-Access-Key header', async () => {
+			env.ACCESS_KEY = 'secret-key';
+			mockCloudflareClient.user.tokens.verify.mockResolvedValue({ id: 'tid', status: 'active' } as any);
+			mockCloudflareClient.zones.list.mockResolvedValue({ result: [] } as any);
+
+			const request = createMockRequest('https://example.com/update?ip4=1.2.3.4&hostnames=test.example.com', {
+				headers: {
+					Authorization: createBearerHeader('cf-token'),
+					'X-Access-Key': 'secret-key',
+				},
+			});
+
+			const response = await worker.fetch(request, env, ctx);
+
+			expect(response.status).toBe(400);
+			expect(mockCloudflareClient.user.tokens.verify).toHaveBeenCalled();
+		});
+
+		it('rejects with 401 and does NOT call tokens.verify when access key is wrong', async () => {
+			env.ACCESS_KEY = 'secret-key';
+
+			const request = createMockRequest('https://example.com/update?ip4=1.2.3.4&hostnames=test.example.com', {
+				headers: { Authorization: createAuthHeader('wrong-key', 'cf-token') },
+			});
+
+			const response = await worker.fetch(request, env, ctx);
+
+			expect(response.status).toBe(401);
+			const body = (await response.json()) as any;
+			expect(body).toEqual({ success: false, error: 'Access denied.' });
+			// Gate fires before tokens.verify — Cloudflare should never be called for verify
+			expect(mockCloudflareClient.user.tokens.verify).not.toHaveBeenCalled();
+		});
+
+		it('rejects with 401 and does NOT call tokens.verify when no access key is provided', async () => {
+			env.ACCESS_KEY = 'secret-key';
+
+			// Bearer auth with no X-Access-Key header and no username slot
+			const request = createMockRequest('https://example.com/update?ip4=1.2.3.4&hostnames=test.example.com', {
+				headers: { Authorization: createBearerHeader('cf-token') },
+			});
+
+			const response = await worker.fetch(request, env, ctx);
+
+			expect(response.status).toBe(401);
+			const body = (await response.json()) as any;
+			expect(body).toEqual({ success: false, error: 'Access denied.' });
+			expect(mockCloudflareClient.user.tokens.verify).not.toHaveBeenCalled();
 		});
 	});
 
@@ -281,7 +375,7 @@ describe('Worker fetch handler', () => {
 		const validAuth = { Authorization: createAuthHeader('user@example.com', 'token') };
 
 		beforeEach(() => {
-			mockCloudflareClient.user.tokens.verify.mockResolvedValue({ status: 'active' } as any);
+			mockCloudflareClient.user.tokens.verify.mockResolvedValue({ id: 'tid', status: 'active' } as any);
 		});
 
 		it('uses client IPv4 when ip4=auto and CF-Connecting-IP contains a dot', async () => {
@@ -291,7 +385,7 @@ describe('Worker fetch handler', () => {
 				headers: { ...validAuth, 'CF-Connecting-IP': '203.0.113.1' },
 			});
 
-			const response = await worker.fetch(request, env);
+			const response = await worker.fetch(request, env, ctx);
 
 			// Fails with 'No zones available' but confirms IP was resolved and
 			// zones.list was reached (auth + param parsing both passed).
@@ -315,7 +409,7 @@ describe('Worker fetch handler', () => {
 				headers: { ...validAuth, 'CF-Connecting-IP': '2001:db8::1' },
 			});
 
-			const response = await worker.fetch(request, env);
+			const response = await worker.fetch(request, env, ctx);
 			const body = (await response.json()) as any;
 
 			expect(response.status).toBe(200);
@@ -332,7 +426,7 @@ describe('Worker fetch handler', () => {
 				headers: { ...validAuth, 'CF-Connecting-IP': '2001:db8::1' },
 			});
 
-			const response = await worker.fetch(request, env);
+			const response = await worker.fetch(request, env, ctx);
 
 			expect(response.status).toBe(422);
 			const body = (await response.json()) as any;
@@ -351,7 +445,7 @@ describe('Worker fetch handler', () => {
 				headers: { ...validAuth, 'CF-Connecting-IP': '203.0.113.1' },
 			});
 
-			const response = await worker.fetch(request, env);
+			const response = await worker.fetch(request, env, ctx);
 
 			// Fails with 'No zones available' but confirms ip4 resolved and proceeded.
 			expect(response.status).toBe(400);
@@ -363,7 +457,7 @@ describe('Worker fetch handler', () => {
 				headers: validAuth,
 			});
 
-			const response = await worker.fetch(request, env);
+			const response = await worker.fetch(request, env, ctx);
 
 			expect(response.status).toBe(422);
 			const body = (await response.json()) as any;
@@ -378,7 +472,7 @@ describe('Worker fetch handler', () => {
 				headers: validAuth,
 			});
 
-			const response = await worker.fetch(request, env);
+			const response = await worker.fetch(request, env, ctx);
 
 			expect(response.status).toBe(422);
 			const body = (await response.json()) as any;
@@ -393,7 +487,7 @@ describe('Worker fetch handler', () => {
 				headers: validAuth,
 			});
 
-			const response = await worker.fetch(request, env);
+			const response = await worker.fetch(request, env, ctx);
 
 			expect(response.status).toBe(422);
 			const body = (await response.json()) as any;
@@ -408,7 +502,7 @@ describe('Worker fetch handler', () => {
 				headers: validAuth,
 			});
 
-			const response = await worker.fetch(request, env);
+			const response = await worker.fetch(request, env, ctx);
 
 			expect(response.status).toBe(422);
 			const body = (await response.json()) as any;
@@ -423,7 +517,7 @@ describe('Worker fetch handler', () => {
 				headers: validAuth,
 			});
 
-			const response = await worker.fetch(request, env);
+			const response = await worker.fetch(request, env, ctx);
 
 			expect(response.status).toBe(422);
 			const body = (await response.json()) as any;
@@ -443,7 +537,7 @@ describe('Worker fetch handler', () => {
 				headers: validAuth,
 			});
 
-			await worker.fetch(request, env);
+			await worker.fetch(request, env, ctx);
 
 			// The A-record lookup ran with the trimmed address
 			expect(mockCloudflareClient.dns.records.list).toHaveBeenCalledWith(expect.objectContaining({ name: 'test.example.com', type: 'A' }));
@@ -459,7 +553,7 @@ describe('Worker fetch handler', () => {
 				headers: validAuth,
 			});
 
-			await worker.fetch(request, env);
+			await worker.fetch(request, env, ctx);
 
 			expect(mockCloudflareClient.dns.records.list).toHaveBeenCalledWith({
 				zone_id: 'zone1',
@@ -483,7 +577,7 @@ describe('Worker fetch handler', () => {
 				headers: validAuth,
 			});
 
-			const response = await worker.fetch(request, env);
+			const response = await worker.fetch(request, env, ctx);
 			const body = (await response.json()) as any;
 
 			expect(response.status).toBe(200);
@@ -502,7 +596,7 @@ describe('Worker fetch handler', () => {
 				headers: validAuth,
 			});
 
-			const response = await worker.fetch(request, env);
+			const response = await worker.fetch(request, env, ctx);
 
 			// Fails with 'No matching record found' for the first hostname, but
 			// confirms the comma-separated list was parsed and the first lookup ran.
@@ -537,7 +631,7 @@ describe('Worker fetch handler', () => {
 				headers: validAuth,
 			});
 
-			const response = await worker.fetch(request, env);
+			const response = await worker.fetch(request, env, ctx);
 			const body = (await response.json()) as any;
 
 			expect(response.status).toBe(200);
@@ -556,27 +650,27 @@ describe('Worker fetch handler', () => {
 		const validAuth = { Authorization: createAuthHeader('user@example.com', 'token') };
 
 		it('accepts an active token', async () => {
-			mockCloudflareClient.user.tokens.verify.mockResolvedValue({ status: 'active' } as any);
+			mockCloudflareClient.user.tokens.verify.mockResolvedValue({ id: 'tid', status: 'active' } as any);
 			mockCloudflareClient.zones.list.mockResolvedValue({ result: [] } as any);
 
 			const request = createMockRequest('https://example.com/update?ip4=1.2.3.4&hostnames=test.example.com', {
 				headers: validAuth,
 			});
 
-			await worker.fetch(request, env);
+			await worker.fetch(request, env, ctx);
 
 			// Fails with 'No zones available' but confirms token.verify was called
 			expect(mockCloudflareClient.user.tokens.verify).toHaveBeenCalled();
 		});
 
 		it('rejects an inactive token', async () => {
-			mockCloudflareClient.user.tokens.verify.mockResolvedValue({ status: 'expired' } as any);
+			mockCloudflareClient.user.tokens.verify.mockResolvedValue({ id: 'tid', status: 'expired' } as any);
 
 			const request = createMockRequest('https://example.com/update?ip4=1.2.3.4&hostnames=test.example.com', {
 				headers: validAuth,
 			});
 
-			const response = await worker.fetch(request, env);
+			const response = await worker.fetch(request, env, ctx);
 
 			expect(response.status).toBe(401);
 			const body = (await response.json()) as any;
@@ -595,7 +689,7 @@ describe('Worker fetch handler', () => {
 		const validAuth = { Authorization: createAuthHeader('user@example.com', 'token') };
 
 		beforeEach(() => {
-			mockCloudflareClient.user.tokens.verify.mockResolvedValue({ status: 'active' } as any);
+			mockCloudflareClient.user.tokens.verify.mockResolvedValue({ id: 'tid', status: 'active' } as any);
 		});
 
 		it('skips zone listing and returns 200 when ALL records match their cached IPs', async () => {
@@ -607,7 +701,7 @@ describe('Worker fetch handler', () => {
 				headers: validAuth,
 			});
 
-			const response = await worker.fetch(request, env);
+			const response = await worker.fetch(request, env, ctx);
 
 			expect(response.status).toBe(200);
 			const body = (await response.json()) as any;
@@ -640,7 +734,7 @@ describe('Worker fetch handler', () => {
 				headers: validAuth,
 			});
 
-			await worker.fetch(request, env);
+			await worker.fetch(request, env, ctx);
 
 			expect(kvMock.get).toHaveBeenCalledWith('ip:test.example.com:A');
 			expect(kvMock.put).toHaveBeenCalledWith('ip:test.example.com:A', expect.any(String), { expirationTtl: 2592000 });
@@ -663,7 +757,7 @@ describe('Worker fetch handler', () => {
 				headers: validAuth,
 			});
 
-			await worker.fetch(request, env);
+			await worker.fetch(request, env, ctx);
 
 			const [, rawValue, putOptions] = kvMock.put.mock.calls[0];
 			const parsed = JSON.parse(rawValue) as { ip: string; updatedAt: string };
@@ -682,7 +776,7 @@ describe('Worker fetch handler', () => {
 				headers: validAuth,
 			});
 
-			const response = await worker.fetch(request, env);
+			const response = await worker.fetch(request, env, ctx);
 
 			// Proceeded past the cache miss and reached zone listing
 			expect(mockCloudflareClient.zones.list).toHaveBeenCalled();
@@ -699,7 +793,7 @@ describe('Worker fetch handler', () => {
 				headers: validAuth,
 			});
 
-			const response = await worker.fetch(request, env);
+			const response = await worker.fetch(request, env, ctx);
 
 			expect(mockCloudflareClient.zones.list).toHaveBeenCalled();
 			expect(response.status).toBe(400);
@@ -722,7 +816,7 @@ describe('Worker fetch handler', () => {
 				headers: validAuth,
 			});
 
-			const response = await worker.fetch(request, env);
+			const response = await worker.fetch(request, env, ctx);
 
 			expect(response.status).toBe(200);
 			expect(mockCloudflareClient.dns.records.update).toHaveBeenCalled();
@@ -738,7 +832,7 @@ describe('Worker fetch handler', () => {
 				headers: validAuth,
 			});
 
-			await worker.fetch(request, env);
+			await worker.fetch(request, env, ctx);
 
 			// Proceeded past the cache check
 			expect(mockCloudflareClient.zones.list).toHaveBeenCalled();
@@ -754,7 +848,7 @@ describe('Worker fetch handler', () => {
 				headers: validAuth,
 			});
 
-			await worker.fetch(request, env);
+			await worker.fetch(request, env, ctx);
 
 			expect(mockCloudflareClient.zones.list).toHaveBeenCalled();
 		});
@@ -779,7 +873,7 @@ describe('Worker fetch handler', () => {
 				headers: validAuth,
 			});
 
-			const response = await worker.fetch(request, env);
+			const response = await worker.fetch(request, env, ctx);
 			const body = (await response.json()) as any;
 
 			expect(response.status).toBe(200);
@@ -801,7 +895,7 @@ describe('Worker fetch handler', () => {
 		const validAuth = { Authorization: createAuthHeader('user@example.com', 'token') };
 
 		beforeEach(() => {
-			mockCloudflareClient.user.tokens.verify.mockResolvedValue({ status: 'active' } as any);
+			mockCloudflareClient.user.tokens.verify.mockResolvedValue({ id: 'tid', status: 'active' } as any);
 			(vi.mocked(env.DDNS_KV) as any).get.mockResolvedValue(null);
 		});
 
@@ -816,14 +910,7 @@ describe('Worker fetch handler', () => {
 			// First zone has no match; second zone does
 			mockCloudflareClient.dns.records.list.mockResolvedValueOnce({ result: [] } as any);
 			mockCloudflareClient.dns.records.list.mockResolvedValueOnce({
-				result: [
-					{
-						id: 'record1',
-						name: 'sub.test.com',
-						type: 'A',
-						content: '1.2.3.4',
-					},
-				],
+				result: [{ id: 'record1', name: 'sub.test.com', type: 'A', content: '1.2.3.4' }],
 			} as any);
 
 			mockCloudflareClient.dns.records.update.mockResolvedValue(undefined);
@@ -832,7 +919,7 @@ describe('Worker fetch handler', () => {
 				headers: validAuth,
 			});
 
-			const response = await worker.fetch(request, env);
+			const response = await worker.fetch(request, env, ctx);
 
 			expect(response.status).toBe(200);
 			expect(mockCloudflareClient.dns.records.list).toHaveBeenCalledTimes(2);
@@ -855,7 +942,7 @@ describe('Worker fetch handler', () => {
 				headers: validAuth,
 			});
 
-			const response = await worker.fetch(request, env);
+			const response = await worker.fetch(request, env, ctx);
 
 			expect(response.status).toBe(200);
 			// Only the matching zone was searched
@@ -872,7 +959,7 @@ describe('Worker fetch handler', () => {
 				headers: validAuth,
 			});
 
-			const response = await worker.fetch(request, env);
+			const response = await worker.fetch(request, env, ctx);
 
 			expect(response.status).toBe(400);
 			const body = (await response.json()) as any;
@@ -889,7 +976,7 @@ describe('Worker fetch handler', () => {
 				headers: validAuth,
 			});
 
-			const response = await worker.fetch(request, env);
+			const response = await worker.fetch(request, env, ctx);
 
 			expect(response.status).toBe(400);
 			const body = (await response.json()) as any;
@@ -909,7 +996,7 @@ describe('Worker fetch handler', () => {
 				headers: validAuth,
 			});
 
-			const response = await worker.fetch(request, env);
+			const response = await worker.fetch(request, env, ctx);
 
 			expect(response.status).toBe(400);
 			const body = (await response.json()) as any;
@@ -927,21 +1014,14 @@ describe('Worker fetch handler', () => {
 				],
 			} as any);
 			mockCloudflareClient.dns.records.list.mockResolvedValue({
-				result: [
-					{
-						id: 'record1',
-						name: 'test.example.com',
-						type: 'A',
-						content: '1.2.3.4',
-					},
-				],
+				result: [{ id: 'record1', name: 'test.example.com', type: 'A', content: '1.2.3.4' }],
 			} as any);
 
 			const request = createMockRequest('https://example.com/update?ip4=1.2.3.5&hostnames=test.example.com', {
 				headers: validAuth,
 			});
 
-			const response = await worker.fetch(request, env);
+			const response = await worker.fetch(request, env, ctx);
 
 			expect(response.status).toBe(400);
 			const body = (await response.json()) as any;
@@ -960,7 +1040,7 @@ describe('Worker fetch handler', () => {
 		const validAuth = { Authorization: createAuthHeader('user@example.com', 'token') };
 
 		beforeEach(() => {
-			mockCloudflareClient.user.tokens.verify.mockResolvedValue({ status: 'active' } as any);
+			mockCloudflareClient.user.tokens.verify.mockResolvedValue({ id: 'token-id-123', status: 'active' } as any);
 			(vi.mocked(env.DDNS_KV) as any).get.mockResolvedValue(null);
 			(vi.mocked(env.DDNS_KV) as any).put.mockResolvedValue(undefined);
 		});
@@ -974,15 +1054,7 @@ describe('Worker fetch handler', () => {
 			} as any);
 			mockCloudflareClient.dns.records.list.mockResolvedValue({
 				result: [
-					{
-						id: 'record1',
-						name: 'test.example.com',
-						type: 'A',
-						content: '1.2.3.4',
-						proxied: true,
-						comment: 'Test record',
-						ttl: 300,
-					},
+					{ id: 'record1', name: 'test.example.com', type: 'A', content: '1.2.3.4', proxied: true, comment: 'Test record', ttl: 300 },
 				],
 			} as any);
 			mockCloudflareClient.dns.records.update.mockResolvedValue(undefined);
@@ -991,7 +1063,7 @@ describe('Worker fetch handler', () => {
 				headers: validAuth,
 			});
 
-			const response = await worker.fetch(request, env);
+			const response = await worker.fetch(request, env, ctx);
 
 			expect(response.status).toBe(200);
 			const body = (await response.json()) as any;
@@ -1033,7 +1105,7 @@ describe('Worker fetch handler', () => {
 				headers: validAuth,
 			});
 
-			const response = await worker.fetch(request, env);
+			const response = await worker.fetch(request, env, ctx);
 			const body = (await response.json()) as any;
 
 			expect(response.status).toBe(200);
@@ -1063,7 +1135,7 @@ describe('Worker fetch handler', () => {
 				headers: validAuth,
 			});
 
-			await worker.fetch(request, env);
+			await worker.fetch(request, env, ctx);
 
 			expect(pushNtfyMock).toHaveBeenCalledWith([], env);
 		});
@@ -1090,7 +1162,7 @@ describe('Worker fetch handler', () => {
 				headers: validAuth,
 			});
 
-			const response = await worker.fetch(request, env);
+			const response = await worker.fetch(request, env, ctx);
 
 			expect(response.status).toBe(200);
 			const body = (await response.json()) as any;
@@ -1124,7 +1196,7 @@ describe('Worker fetch handler', () => {
 				headers: validAuth,
 			});
 
-			const response = await worker.fetch(request, env);
+			const response = await worker.fetch(request, env, ctx);
 
 			expect(response.status).toBe(200);
 			expect(mockCloudflareClient.dns.records.update).toHaveBeenCalledWith('record1', {
@@ -1154,9 +1226,242 @@ describe('Worker fetch handler', () => {
 				headers: validAuth,
 			});
 
-			await worker.fetch(request, env);
+			await worker.fetch(request, env, ctx);
 
 			expect(pushNtfyMock).toHaveBeenCalledTimes(1);
+		});
+	});
+
+	// -------------------------------------------------------------------------
+	// Audit events  (ctx.waitUntil + AUDIT_DB.batch)
+	// -------------------------------------------------------------------------
+
+	describe('Audit events', () => {
+		const validAuth = { Authorization: createAuthHeader('user@example.com', 'token') };
+
+		beforeEach(() => {
+			mockCloudflareClient.user.tokens.verify.mockResolvedValue({ id: 'token-id-123', status: 'active' } as any);
+			(vi.mocked(env.DDNS_KV) as any).get.mockResolvedValue(null);
+			(vi.mocked(env.DDNS_KV) as any).put.mockResolvedValue(undefined);
+		});
+
+		it('calls ctx.waitUntil with a Promise when a record reaches the DNS API', async () => {
+			mockCloudflareClient.zones.list.mockResolvedValue({
+				result: [{ id: 'zone1', name: 'example.com' }],
+			} as any);
+			mockCloudflareClient.dns.records.list.mockResolvedValue({
+				result: [{ id: 'r1', name: 'test.example.com', type: 'A', content: '1.2.3.0', proxied: false, ttl: 1 }],
+			} as any);
+			mockCloudflareClient.dns.records.update.mockResolvedValue(undefined);
+
+			const request = createMockRequest('https://example.com/update?ip4=1.2.3.4&hostnames=test.example.com', {
+				headers: validAuth,
+			});
+
+			await worker.fetch(request, env, ctx);
+
+			expect(waitUntilMock).toHaveBeenCalledTimes(1);
+			const [arg] = waitUntilMock.mock.calls[0] as [unknown];
+			// The argument must be a Promise (writeAuditEvents returns one)
+			expect(arg).toBeInstanceOf(Promise);
+		});
+
+		it('does NOT call ctx.waitUntil on the cache fast-path (nothing touched)', async () => {
+			const kvMock = vi.mocked(env.DDNS_KV) as any;
+			kvMock.get.mockResolvedValue(JSON.stringify({ ip: '1.2.3.4', updatedAt: '2024-01-01T00:00:00.000Z' }));
+
+			const request = createMockRequest('https://example.com/update?ip4=1.2.3.4&hostnames=test.example.com', {
+				headers: validAuth,
+			});
+
+			await worker.fetch(request, env, ctx);
+
+			expect(waitUntilMock).not.toHaveBeenCalled();
+		});
+
+		it('passes one correctly-shaped audit event to AUDIT_DB.batch per record that reached DNS', async () => {
+			mockCloudflareClient.zones.list.mockResolvedValue({
+				result: [{ id: 'zone1', name: 'example.com' }],
+			} as any);
+			// Previous content differs from the new IP so an update fires
+			mockCloudflareClient.dns.records.list.mockResolvedValue({
+				result: [{ id: 'r1', name: 'test.example.com', type: 'A', content: '1.2.3.0', proxied: false, ttl: 1 }],
+			} as any);
+			mockCloudflareClient.dns.records.update.mockResolvedValue(undefined);
+
+			const request = createMockRequest('https://example.com/update?ip4=1.2.3.4&hostnames=test.example.com', {
+				headers: { ...validAuth, 'CF-Connecting-IP': '5.6.7.8' },
+			});
+
+			await worker.fetch(request, env, ctx);
+
+			// Await the waitUntil promise so the batch call has been made
+			const [waitUntilArg] = waitUntilMock.mock.calls[0] as [Promise<void>];
+			await waitUntilArg;
+
+			const auditDbMock = vi.mocked(env.AUDIT_DB) as any;
+			expect(auditDbMock.batch).toHaveBeenCalledTimes(1);
+
+			// batch receives an array of bound statements; one per record
+			const [batchArg] = auditDbMock.batch.mock.calls[0] as [unknown[]];
+			expect(batchArg).toHaveLength(1);
+
+			// The statement was bound with the correct field values
+			const stmtMock = auditDbMock.prepare();
+			expect(stmtMock.bind).toHaveBeenCalledWith(
+				expect.stringMatching(/^\d{4}-\d{2}-\d{2}T/), // occurredAt ISO string
+				'token-id-123', // tokenId from verify response
+				'5.6.7.8', // callerIp from CF-Connecting-IP
+				'test.example.com', // hostname
+				'A', // recordType
+				'1.2.3.0', // previousIp from existing DNS record content
+				'1.2.3.4', // newIp
+				'updated', // outcome
+			);
+		});
+
+		it('records outcome no-change in the audit event when DNS content already matches', async () => {
+			mockCloudflareClient.zones.list.mockResolvedValue({
+				result: [{ id: 'zone1', name: 'example.com' }],
+			} as any);
+			// Content matches → no update called, but record still reached DNS API
+			mockCloudflareClient.dns.records.list.mockResolvedValue({
+				result: [{ id: 'r1', name: 'test.example.com', type: 'A', content: '1.2.3.4', proxied: false, ttl: 1 }],
+			} as any);
+
+			const request = createMockRequest('https://example.com/update?ip4=1.2.3.4&hostnames=test.example.com', {
+				headers: validAuth,
+			});
+
+			await worker.fetch(request, env, ctx);
+
+			const [waitUntilArg] = waitUntilMock.mock.calls[0] as [Promise<void>];
+			await waitUntilArg;
+
+			const auditDbMock = vi.mocked(env.AUDIT_DB) as any;
+			const stmtMock = auditDbMock.prepare();
+			// Last positional argument to bind is the outcome
+			const bindArgs = stmtMock.bind.mock.calls.at(-1) as unknown[];
+			expect(bindArgs[7]).toBe('no-change');
+		});
+	});
+
+	// -------------------------------------------------------------------------
+	// GET /history endpoint
+	// -------------------------------------------------------------------------
+
+	describe('GET /history endpoint', () => {
+		const validAuth = { Authorization: createAuthHeader('user@example.com', 'token') };
+
+		beforeEach(() => {
+			mockCloudflareClient.user.tokens.verify.mockResolvedValue({ id: 'token-id-123', status: 'active' } as any);
+		});
+
+		it('returns 200 with events array using default limit of 100', async () => {
+			const auditDbMock = vi.mocked(env.AUDIT_DB) as any;
+			const stmtMock = auditDbMock.prepare();
+			stmtMock.all.mockResolvedValue({
+				results: [{ hostname: 'test.example.com', outcome: 'updated' }],
+			});
+
+			const request = createMockRequest('https://example.com/history', {
+				headers: validAuth,
+			});
+
+			const response = await worker.fetch(request, env, ctx);
+			const body = (await response.json()) as any;
+
+			expect(response.status).toBe(200);
+			expect(body).toMatchObject({
+				success: true,
+				data: { events: [{ hostname: 'test.example.com', outcome: 'updated' }] },
+			});
+			// token_id bound first, then limit (100) — no hostname in the middle
+			expect(stmtMock.bind).toHaveBeenCalledWith('token-id-123', 100);
+		});
+
+		it('respects an explicit limit parameter', async () => {
+			const auditDbMock = vi.mocked(env.AUDIT_DB) as any;
+			const stmtMock = auditDbMock.prepare();
+			stmtMock.all.mockResolvedValue({ results: [] });
+
+			const request = createMockRequest('https://example.com/history?limit=25', {
+				headers: validAuth,
+			});
+
+			await worker.fetch(request, env, ctx);
+
+			expect(stmtMock.bind).toHaveBeenCalledWith('token-id-123', 25);
+		});
+
+		it('clamps limit to 1000 when the provided value exceeds the maximum', async () => {
+			const auditDbMock = vi.mocked(env.AUDIT_DB) as any;
+			const stmtMock = auditDbMock.prepare();
+			stmtMock.all.mockResolvedValue({ results: [] });
+
+			const request = createMockRequest('https://example.com/history?limit=9999', {
+				headers: validAuth,
+			});
+
+			await worker.fetch(request, env, ctx);
+
+			expect(stmtMock.bind).toHaveBeenCalledWith('token-id-123', 1000);
+		});
+
+		it('clamps limit to 1 when the provided value is less than 1', async () => {
+			const auditDbMock = vi.mocked(env.AUDIT_DB) as any;
+			const stmtMock = auditDbMock.prepare();
+			stmtMock.all.mockResolvedValue({ results: [] });
+
+			const request = createMockRequest('https://example.com/history?limit=0', {
+				headers: validAuth,
+			});
+
+			await worker.fetch(request, env, ctx);
+
+			expect(stmtMock.bind).toHaveBeenCalledWith('token-id-123', 1);
+		});
+
+		it('falls back to default limit when limit param is non-numeric', async () => {
+			const auditDbMock = vi.mocked(env.AUDIT_DB) as any;
+			const stmtMock = auditDbMock.prepare();
+			stmtMock.all.mockResolvedValue({ results: [] });
+
+			const request = createMockRequest('https://example.com/history?limit=banana', {
+				headers: validAuth,
+			});
+
+			await worker.fetch(request, env, ctx);
+
+			expect(stmtMock.bind).toHaveBeenCalledWith('token-id-123', 100);
+		});
+
+		it('filters by hostname when the hostname query param is provided', async () => {
+			const auditDbMock = vi.mocked(env.AUDIT_DB) as any;
+			const stmtMock = auditDbMock.prepare();
+			stmtMock.all.mockResolvedValue({ results: [] });
+
+			const request = createMockRequest('https://example.com/history?hostname=test.example.com', {
+				headers: validAuth,
+			});
+
+			await worker.fetch(request, env, ctx);
+
+			// When hostname is set: token_id, hostname, limit are all bound in that order
+			expect(stmtMock.bind).toHaveBeenCalledWith('token-id-123', 'test.example.com', 100);
+		});
+
+		it('returns 405 for non-GET requests to /history', async () => {
+			const request = createMockRequest('https://example.com/history', {
+				method: 'POST',
+				headers: validAuth,
+			});
+
+			const response = await worker.fetch(request, env, ctx);
+
+			expect(response.status).toBe(405);
+			const body = (await response.json()) as any;
+			expect(body).toEqual({ success: false, error: 'Method not allowed.' });
 		});
 	});
 
@@ -1173,7 +1478,7 @@ describe('Worker fetch handler', () => {
 				headers: validAuth,
 			});
 
-			const response = await worker.fetch(request, createMockEnv());
+			const response = await worker.fetch(request, createMockEnv(), createMockCtx().ctx);
 
 			expect(response.status).toBe(422);
 			const body = (await response.json()) as any;
@@ -1190,7 +1495,7 @@ describe('Worker fetch handler', () => {
 				headers: validAuth,
 			});
 
-			const response = await worker.fetch(request, createMockEnv());
+			const response = await worker.fetch(request, createMockEnv(), createMockCtx().ctx);
 
 			expect(response.status).toBe(500);
 			const body = (await response.json()) as any;
@@ -1201,14 +1506,14 @@ describe('Worker fetch handler', () => {
 		});
 
 		it('maps Cloudflare API errors to 500', async () => {
-			mockCloudflareClient.user.tokens.verify.mockResolvedValue({ status: 'active' } as any);
+			mockCloudflareClient.user.tokens.verify.mockResolvedValue({ id: 'tid', status: 'active' } as any);
 			mockCloudflareClient.zones.list.mockRejectedValue(new Error('API rate limit exceeded'));
 
 			const request = createMockRequest('https://example.com/update?ip4=1.2.3.4&hostnames=test.example.com', {
 				headers: validAuth,
 			});
 
-			const response = await worker.fetch(request, createMockEnv());
+			const response = await worker.fetch(request, createMockEnv(), createMockCtx().ctx);
 
 			expect(response.status).toBe(500);
 			const body = (await response.json()) as any;
@@ -1219,7 +1524,7 @@ describe('Worker fetch handler', () => {
 		});
 
 		it('success responses do not include a previousIp field', async () => {
-			mockCloudflareClient.user.tokens.verify.mockResolvedValue({ status: 'active' } as any);
+			mockCloudflareClient.user.tokens.verify.mockResolvedValue({ id: 'tid', status: 'active' } as any);
 			(vi.mocked(env.DDNS_KV) as any).get.mockResolvedValue(null);
 			(vi.mocked(env.DDNS_KV) as any).put.mockResolvedValue(undefined);
 
@@ -1235,7 +1540,7 @@ describe('Worker fetch handler', () => {
 				headers: validAuth,
 			});
 
-			const response = await worker.fetch(request, env);
+			const response = await worker.fetch(request, env, ctx);
 			const body = (await response.json()) as any;
 
 			expect(body.data).not.toHaveProperty('previousIp');
@@ -1257,21 +1562,13 @@ describe('Worker fetch handler', () => {
 			kvMock.get.mockResolvedValue(JSON.stringify({ ip: '1.2.3.4', updatedAt: '2024-01-01T00:00:00.000Z' }));
 			kvMock.put.mockResolvedValue(undefined);
 
-			mockCloudflareClient.user.tokens.verify.mockResolvedValue({ status: 'active' } as any);
+			mockCloudflareClient.user.tokens.verify.mockResolvedValue({ id: 'token-id-123', status: 'active' } as any);
 			mockCloudflareClient.zones.list.mockResolvedValue({
 				result: [{ id: 'zone1', name: 'example.com' }],
 			} as any);
 			mockCloudflareClient.dns.records.list.mockResolvedValue({
 				result: [
-					{
-						id: 'record1',
-						name: 'test.example.com',
-						type: 'A',
-						content: '1.2.3.4',
-						proxied: true,
-						comment: 'Managed by DDNS',
-						ttl: 300,
-					},
+					{ id: 'record1', name: 'test.example.com', type: 'A', content: '1.2.3.4', proxied: true, comment: 'Managed by DDNS', ttl: 300 },
 				],
 			} as any);
 			mockCloudflareClient.dns.records.update.mockResolvedValue(undefined);
@@ -1280,7 +1577,7 @@ describe('Worker fetch handler', () => {
 				headers: validAuth,
 			});
 
-			const response = await worker.fetch(request, env);
+			const response = await worker.fetch(request, env, ctx);
 
 			expect(response.status).toBe(200);
 			const body = (await response.json()) as any;
@@ -1300,6 +1597,7 @@ describe('Worker fetch handler', () => {
 			expect(mockCloudflareClient.dns.records.list).toHaveBeenCalled();
 			expect(mockCloudflareClient.dns.records.update).toHaveBeenCalled();
 			expect(kvMock.put).toHaveBeenCalledWith('ip:test.example.com:A', expect.any(String), { expirationTtl: 2592000 });
+			expect(waitUntilMock).toHaveBeenCalled();
 			expect(pushNtfyMock).toHaveBeenCalled();
 		});
 
@@ -1317,7 +1615,7 @@ describe('Worker fetch handler', () => {
 				headers: { Authorization: createBearerHeader('my-raw-api-token') },
 			});
 
-			const response = await worker.fetch(request, env);
+			const response = await worker.fetch(request, env, ctx);
 
 			expect(response.status).toBe(200);
 			expect(vi.mocked(Cloudflare)).toHaveBeenCalledWith({ apiToken: 'my-raw-api-token' });
@@ -1331,7 +1629,7 @@ describe('Worker fetch handler', () => {
 				headers: { Authorization: createAuthHeader('user@example.com', 'api-token') },
 			});
 
-			const response = await worker.fetch(request, env);
+			const response = await worker.fetch(request, env, ctx);
 
 			expect(response.status).toBe(422);
 			const body = (await response.json()) as any;
@@ -1349,7 +1647,7 @@ describe('Worker fetch handler', () => {
 			kvMock.get.mockResolvedValue(null);
 			kvMock.put.mockResolvedValue(undefined);
 
-			mockCloudflareClient.user.tokens.verify.mockResolvedValue({ status: 'active' } as any);
+			mockCloudflareClient.user.tokens.verify.mockResolvedValue({ id: 'token-id-123', status: 'active' } as any);
 			mockCloudflareClient.zones.list.mockResolvedValue({
 				result: [{ id: 'zone1', name: 'example.com' }],
 			} as any);
@@ -1374,12 +1672,11 @@ describe('Worker fetch handler', () => {
 				headers: { Authorization: createAuthHeader('user', 'token') },
 			});
 
-			const response = await worker.fetch(request, env);
+			const response = await worker.fetch(request, env, ctx);
 			const body = (await response.json()) as any;
 
 			expect(response.status).toBe(200);
 			expect(body.data.records).toHaveLength(4);
-			// Both A and AAAA types present
 			const types = (body.data.records as any[]).map((r: any) => r.type as string);
 			expect(types.filter((t) => t === 'A')).toHaveLength(2);
 			expect(types.filter((t) => t === 'AAAA')).toHaveLength(2);

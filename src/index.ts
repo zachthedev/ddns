@@ -1,4 +1,5 @@
-import { Cloudflare, type ClientOptions } from 'cloudflare';
+import { Cloudflare } from 'cloudflare';
+import { HISTORY_DEFAULT_LIMIT, queryHistory, writeAuditEvents, type AuditEvent } from './audit';
 import { pushNtfy } from './pushNtfy';
 
 /**
@@ -60,22 +61,37 @@ interface UpdateResponseBody {
 	};
 }
 
-function jsonResponse(body: UpdateResponseBody | { success: false; error: string }, status: number): Response {
+interface HistoryResponseBody {
+	success: boolean;
+	data: {
+		events: Record<string, unknown>[];
+	};
+}
+
+function jsonResponse(body: UpdateResponseBody | HistoryResponseBody | { success: false; error: string }, status: number): Response {
 	return new Response(JSON.stringify(body), {
 		status,
 		headers: { 'Content-Type': 'application/json' },
 	});
 }
 
+interface ParsedAuth {
+	/** The Basic username, when one was sent. Carries the access key for UniFi callers. */
+	username: string | null;
+	/** The Cloudflare API token. */
+	token: string;
+}
+
 /**
- * Extracts the Cloudflare API token from the Authorization header.
+ * Extracts credentials from the Authorization header.
  *
  * Two forms are accepted:
- * - `Basic base64(username:token)`: what UniFi devices send. The username is
- *   ignored; only the DNS-scoped API token matters.
+ * - `Basic base64(username:token)`: what UniFi devices send. The username
+ *   carries the access key when one is configured; auth itself only uses
+ *   the DNS-scoped API token.
  * - `Bearer token`: the raw token, for direct callers.
  */
-function constructClientOptions(request: Request): ClientOptions {
+function parseAuthorization(request: Request): ParsedAuth {
 	const authHeader = request.headers.get('Authorization');
 	if (authHeader === null || authHeader === '') {
 		throw new HttpError(401, 'Authorization required.');
@@ -87,7 +103,7 @@ function constructClientOptions(request: Request): ClientOptions {
 	}
 
 	if (scheme === 'Bearer') {
-		return { apiToken: payload };
+		return { username: null, token: payload };
 	}
 
 	if (scheme !== 'Basic') {
@@ -112,7 +128,33 @@ function constructClientOptions(request: Request): ClientOptions {
 		throw new HttpError(401, 'Invalid authorization credentials.');
 	}
 
-	return { apiToken: token };
+	return { username: decoded.slice(0, delimiterIndex), token };
+}
+
+/** Constant-time string comparison via digest equality. */
+async function timingSafeEquals(a: string, b: string): Promise<boolean> {
+	const encoder = new TextEncoder();
+	const [digestA, digestB] = await Promise.all([
+		crypto.subtle.digest('SHA-256', encoder.encode(a)),
+		crypto.subtle.digest('SHA-256', encoder.encode(b)),
+	]);
+	return crypto.subtle.timingSafeEqual(digestA, digestB);
+}
+
+/**
+ * Optional pre-auth gate. When the ACCESS_KEY secret is set, callers must
+ * present it in the Basic username (UniFi's Username field) or an
+ * X-Access-Key header. Checked before any Cloudflare API call, KV read, or
+ * D1 write, so strangers cost nothing beyond the worker invocation.
+ */
+async function checkAccess(env: Env, request: Request, auth: ParsedAuth): Promise<void> {
+	if (!env.ACCESS_KEY) {
+		return;
+	}
+	const provided = request.headers.get('X-Access-Key') ?? auth.username;
+	if (provided === null || provided === '' || !(await timingSafeEquals(provided, env.ACCESS_KEY))) {
+		throw new HttpError(401, 'Access denied.');
+	}
 }
 
 interface ResolvedIps {
@@ -225,18 +267,29 @@ async function writeCachedIp(env: Env, record: DDNSRecord): Promise<void> {
 	}
 }
 
-async function updateHostnames(clientOptions: ClientOptions, updateRequest: UpdateRequest, env: Env): Promise<Response> {
-	const { records, zoneFilter } = updateRequest;
-	const cloudflare = new Cloudflare(clientOptions);
-
-	// Verify token status
-	const { status: tokenStatus } = await cloudflare.user.tokens.verify();
-	if (tokenStatus !== 'active') {
-		throw new HttpError(401, `Authentication failed: token ${tokenStatus}`);
+/** Verifies the token is active and returns its ID (the audit tenant key). */
+async function verifyToken(cloudflare: Cloudflare): Promise<string> {
+	const verification = await cloudflare.user.tokens.verify();
+	if (verification.status !== 'active') {
+		throw new HttpError(401, `Authentication failed: token ${verification.status}`);
 	}
+	return verification.id;
+}
+
+async function updateHostnames(
+	auth: ParsedAuth,
+	updateRequest: UpdateRequest,
+	request: Request,
+	env: Env,
+	ctx: ExecutionContext,
+): Promise<Response> {
+	const { records, zoneFilter } = updateRequest;
+	const cloudflare = new Cloudflare({ apiToken: auth.token });
+	const tokenId = await verifyToken(cloudflare);
 
 	// Fast path: when every record's cached IP already matches, skip the
-	// zone and record API calls entirely.
+	// zone and record API calls entirely. Deliberately unaudited: nothing
+	// was touched, and polling devices would add hundreds of rows per day.
 	const cachedIps = await Promise.all(records.map(async (record) => readCachedIp(env, record)));
 	const pending = records.filter((record, i) => cachedIps[i] !== record.content);
 	if (pending.length === 0) {
@@ -265,8 +318,10 @@ async function updateHostnames(clientOptions: ClientOptions, updateRequest: Upda
 		throw new HttpError(400, 'No zones available with current permissions.');
 	}
 
+	const callerIp = request.headers.get('CF-Connecting-IP');
 	const updateMessages: string[] = [];
 	const results: RecordResult[] = [];
+	const auditEvents: AuditEvent[] = [];
 
 	for (const record of records) {
 		if (!pending.includes(record)) {
@@ -313,8 +368,8 @@ async function updateHostnames(clientOptions: ClientOptions, updateRequest: Upda
 			throw new HttpError(400, `Multiple matching records found for '${record.name}'. Specify a unique hostname per zone.`);
 		}
 
-		// Notifications key off the actual DNS delta, never the cache: a
-		// cache miss on an unchanged record refreshes silently.
+		// Notifications and audit rows key off the actual DNS delta, never
+		// the cache: a cache miss on an unchanged record refreshes silently.
 		const changed = match.content !== record.content;
 		if (changed) {
 			await cloudflare.dns.records.update(match.id, {
@@ -336,7 +391,20 @@ async function updateHostnames(clientOptions: ClientOptions, updateRequest: Upda
 
 		await writeCachedIp(env, record);
 		results.push({ hostname: record.name, type: record.type, ip: record.content, updated: changed });
+		auditEvents.push({
+			occurredAt: new Date().toISOString(),
+			tokenId,
+			callerIp,
+			hostname: record.name,
+			recordType: record.type,
+			previousIp: match.content ?? null,
+			newIp: record.content,
+			outcome: changed ? 'updated' : 'no-change',
+		});
 	}
+
+	// Audit writes ride after the response; a D1 hiccup never fails the update.
+	ctx.waitUntil(writeAuditEvents(env, auditEvents));
 
 	// Send one grouped notification for the records that actually changed
 	await pushNtfy(updateMessages, env);
@@ -355,8 +423,22 @@ async function updateHostnames(clientOptions: ClientOptions, updateRequest: Upda
 	);
 }
 
+/** GET /history: the caller's own audit rows, newest first. */
+async function handleHistory(auth: ParsedAuth, request: Request, env: Env): Promise<Response> {
+	const cloudflare = new Cloudflare({ apiToken: auth.token });
+	const tokenId = await verifyToken(cloudflare);
+
+	const { searchParams } = new URL(request.url);
+	const hostname = searchParams.get('hostname')?.trim() ?? null;
+	const limitParam = Number(searchParams.get('limit') ?? HISTORY_DEFAULT_LIMIT);
+	const limit = Number.isFinite(limitParam) ? limitParam : HISTORY_DEFAULT_LIMIT;
+
+	const events = await queryHistory(env, { tokenId, hostname, limit });
+	return jsonResponse({ success: true, data: { events } }, 200);
+}
+
 export default {
-	async fetch(request: Request, env: Env): Promise<Response> {
+	async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
 		// The handler only consumes query params; never log request bodies
 		// (unauthenticated callers could write arbitrary content into logs).
 		console.log('Incoming request:', {
@@ -366,14 +448,24 @@ export default {
 		});
 
 		try {
-			const clientOptions = constructClientOptions(request);
+			const auth = parseAuthorization(request);
+			await checkAccess(env, request, auth);
+
+			const { pathname } = new URL(request.url);
+			if (pathname === '/history') {
+				if (request.method !== 'GET') {
+					throw new HttpError(405, 'Method not allowed.');
+				}
+				return await handleHistory(auth, request, env);
+			}
+
 			const updateRequest = constructDNSRecords(request);
-			return await updateHostnames(clientOptions, updateRequest, env);
+			return await updateHostnames(auth, updateRequest, request, env, ctx);
 		} catch (err: unknown) {
 			const isHttpError = err instanceof HttpError;
 			const message = isHttpError ? err.message : 'Internal Server Error';
 			const statusCode = isHttpError ? err.statusCode : 500;
-			console.error(`Error updating DNS record: ${message}`, err);
+			console.error(`Error handling request: ${message}`, err);
 			return jsonResponse({ success: false, error: message }, statusCode);
 		}
 	},

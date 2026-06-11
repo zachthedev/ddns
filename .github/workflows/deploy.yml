@@ -34,4 +34,6 @@ jobs:
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           KV_NAMESPACE_ID: ${{ secrets.KV_NAMESPACE_ID }}
           KV_NAMESPACE_PREVIEW_ID: ${{ secrets.KV_NAMESPACE_PREVIEW_ID }}
+          D1_DATABASE_ID: ${{ secrets.D1_DATABASE_ID }}
           NTFY_URL: ${{ secrets.NTFY_URL }}
+          ACCESS_KEY: ${{ secrets.ACCESS_KEY }}

@@ -1,21 +1,22 @@
 #!/usr/bin/env bun
 import { $ } from 'bun';
-import { CONFIG_PATHS, ENV_KEYS, HEX_ID_PATTERN, loadConfig } from './lib/wrangler-config';
+import { CONFIG_PATHS, ENV_KEYS, HEX_ID_PATTERN, UUID_PATTERN, loadConfig } from './lib/wrangler-config';
 
 /**
  * One-time interactive setup for a new deployment (fork or first clone).
- * Provisions the KV namespaces this worker needs (binding name read from
- * wrangler.jsonc), writes their IDs to .env.local (gitignored), and
- * optionally configures the NTFY_URL secret.
+ * Provisions the KV namespaces and D1 audit database this worker needs
+ * (binding names read from wrangler.jsonc), writes their IDs and optional
+ * secrets to .env.local (gitignored), and applies D1 migrations.
  *
- * After running this, `bun run deploy` works locally, and the same IDs can
- * be added as GitHub Actions secrets for CI deploys.
+ * After running this, `bun run deploy` works locally (it reads .env.local
+ * and syncs worker secrets), and the same values can be added as GitHub
+ * Actions secrets for CI deploys.
  */
 
-function extractId(output: string, label: string): string {
-	const match = new RegExp(HEX_ID_PATTERN.source).exec(output);
+function extractFirst(pattern: RegExp, output: string, label: string): string {
+	const match = new RegExp(pattern.source).exec(output);
 	if (!match) {
-		console.error(`Could not find a namespace ID in wrangler output for ${label}:`);
+		console.error(`Could not find an ID in wrangler output for ${label}:`);
 		console.error(output);
 		process.exit(1);
 	}
@@ -29,9 +30,10 @@ async function main(): Promise<void> {
 	}
 
 	const config = await loadConfig();
-	const binding = config.kv_namespaces?.[0]?.binding;
-	if (binding === undefined || binding === '') {
-		console.error('No KV namespace binding found in wrangler.jsonc');
+	const kvBinding = config.kv_namespaces?.[0]?.binding;
+	const d1 = config.d1_databases?.[0];
+	if (kvBinding === undefined || kvBinding === '' || d1 === undefined) {
+		console.error('wrangler.jsonc is missing the KV namespace or D1 database entry');
 		process.exit(1);
 	}
 
@@ -55,48 +57,73 @@ async function main(): Promise<void> {
 		accountId = entered.trim();
 	}
 	console.log(`Using account ${accountId}`);
+	process.env[ENV_KEYS.accountId] = accountId;
 
 	if (await Bun.file(CONFIG_PATHS.envLocal).exists()) {
-		const overwrite = confirm('.env.local already exists. Re-provision KV namespaces and overwrite it?');
+		const overwrite = confirm('.env.local already exists. Re-provision resources and overwrite it?');
 		if (!overwrite) {
 			console.log('Keeping existing .env.local; nothing to do.');
 			return;
 		}
 	}
 
-	console.log(`Creating KV namespace ${binding}…`);
-	const prod = await $`bun x wrangler kv namespace create ${binding}`.text();
-	const prodId = extractId(prod, binding);
-	console.log(`  production: ${prodId}`);
+	console.log(`Creating KV namespace ${kvBinding}…`);
+	const prod = await $`bun x wrangler kv namespace create ${kvBinding}`.text();
+	const kvId = extractFirst(HEX_ID_PATTERN, prod, kvBinding);
+	console.log(`  production: ${kvId}`);
 
 	console.log('Creating preview KV namespace…');
-	const preview = await $`bun x wrangler kv namespace create ${binding} --preview`.text();
-	const previewId = extractId(preview, `${binding} --preview`);
-	console.log(`  preview: ${previewId}`);
+	const preview = await $`bun x wrangler kv namespace create ${kvBinding} --preview`.text();
+	const kvPreviewId = extractFirst(HEX_ID_PATTERN, preview, `${kvBinding} --preview`);
+	console.log(`  preview: ${kvPreviewId}`);
+
+	console.log(`Creating D1 database ${d1.database_name}…`);
+	const d1Out = await $`bun x wrangler d1 create ${d1.database_name}`.nothrow().text();
+	const d1Id = extractFirst(UUID_PATTERN, d1Out, d1.database_name);
+	console.log(`  database: ${d1Id}`);
+
+	const ntfy = prompt('ntfy topic URL for change notifications (blank to skip):')?.trim() ?? '';
+	if (ntfy !== '') {
+		await Bun.write(CONFIG_PATHS.devVars, `${ENV_KEYS.ntfyUrl}="${ntfy}"\n`);
+		console.log('.dev.vars written for local dev.');
+	}
+
+	// Locking the worker to your own devices: the key rides in the UniFi
+	// Username field (or X-Access-Key header) and is checked before any
+	// Cloudflare API call.
+	let accessKey = '';
+	if (confirm('Generate an access key so only your devices can use this worker? (recommended)')) {
+		accessKey = crypto.randomUUID().replaceAll('-', '');
+		console.log(`  access key: ${accessKey}`);
+		console.log('  Put this in the UniFi Username field after deploying.');
+	}
 
 	const lines = [
 		'# Local deployment configuration. Not committed.',
 		'# The same values go in GitHub Actions secrets for CI deploys.',
 		`${ENV_KEYS.accountId}=${accountId}`,
-		`${ENV_KEYS.kvId}=${prodId}`,
-		`${ENV_KEYS.kvPreviewId}=${previewId}`,
+		`${ENV_KEYS.kvId}=${kvId}`,
+		`${ENV_KEYS.kvPreviewId}=${kvPreviewId}`,
+		`${ENV_KEYS.d1Id}=${d1Id}`,
+		...(ntfy !== '' ? [`${ENV_KEYS.ntfyUrl}=${ntfy}`] : []),
+		...(accessKey !== '' ? [`${ENV_KEYS.accessKey}=${accessKey}`] : []),
 		'',
 	];
 	await Bun.write(CONFIG_PATHS.envLocal, lines.join('\n'));
 	console.log(`Wrote ${CONFIG_PATHS.envLocal}`);
 
-	const ntfy = prompt('ntfy topic URL for change notifications (blank to skip):');
-	if (ntfy !== null && ntfy.trim() !== '') {
-		await $`bun x wrangler secret put ${ENV_KEYS.ntfyUrl} < ${new Response(ntfy.trim())}`;
-		await Bun.write(CONFIG_PATHS.devVars, `${ENV_KEYS.ntfyUrl}="${ntfy.trim()}"\n`);
-		console.log(`${ENV_KEYS.ntfyUrl} secret set and .dev.vars written for local dev.`);
-	}
+	console.log('Applying D1 migrations…');
+	process.env[ENV_KEYS.kvId] = kvId;
+	process.env[ENV_KEYS.kvPreviewId] = kvPreviewId;
+	process.env[ENV_KEYS.d1Id] = d1Id;
+	await $`bun scripts/deploy.ts --generate-only`;
+	await $`bun x wrangler d1 migrations apply AUDIT_DB --remote --config ${CONFIG_PATHS.deploy}`;
 
 	console.log('\nSetup complete. Next steps:');
-	console.log('  - bun run deploy            (deploy from this machine)');
-	console.log(`  - add ${ENV_KEYS.kvId}, ${ENV_KEYS.kvPreviewId}, CLOUDFLARE_API_TOKEN,`);
-	console.log(`    CLOUDFLARE_ACCOUNT_ID (and optionally ${ENV_KEYS.ntfyUrl}) as GitHub Actions`);
-	console.log('    secrets to deploy on every push to main.');
+	console.log('  - bun run deploy            (deploy from this machine; also syncs secrets)');
+	console.log(`  - add ${ENV_KEYS.kvId}, ${ENV_KEYS.kvPreviewId}, ${ENV_KEYS.d1Id}, CLOUDFLARE_API_TOKEN,`);
+	console.log(`    CLOUDFLARE_ACCOUNT_ID (and optionally ${ENV_KEYS.ntfyUrl}, ${ENV_KEYS.accessKey}) as`);
+	console.log('    GitHub Actions secrets to deploy on every push to main.');
 }
 
 await main();
