@@ -122,4 +122,4 @@ Using this script with various Ubiquiti devices and different UniFi software ver
 
 ## 🙏 **Acknowledgments**
 
-This project began as a fork of [willswire/unifi-ddns](https://github.com/willswire/unifi-ddns) and has since been rewritten end to end. Thanks to Will Swire for the original worker that made UniFi-to-Cloudflare DDNS approachable in the first place.
+This project began as a fork of [willswire/unifi-ddns](https://github.com/willswire/unifi-ddns) and has since been rewritten end to end. Thanks to Will Walker for the original worker that made UniFi-to-Cloudflare DDNS approachable in the first place.

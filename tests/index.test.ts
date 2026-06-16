@@ -1049,6 +1049,24 @@ describe('Worker fetch handler', () => {
 			expect(response.status).toBe(400);
 		});
 
+		it('treats a cached entry with a non-string ip as a miss and proceeds', async () => {
+			const kvMock = vi.mocked(env.DDNS_KV) as any;
+			// Valid JSON, but ip is not a string (a corrupt or partial cache write).
+			kvMock.get.mockResolvedValue(JSON.stringify({ ip: 12345, updatedAt: '2024-01-01T00:00:00.000Z' }));
+
+			mockCloudflareClient.zones.list.mockResolvedValue({ result: [] } as any);
+
+			const request = createMockRequest('https://example.com/update?ip4=1.2.3.4&hostnames=test.example.com', {
+				headers: validAuth,
+			});
+
+			const response = await worker.fetch(request, env, ctx);
+
+			// The non-string ip is discarded, so the fast path is skipped and zone listing runs.
+			expect(mockCloudflareClient.zones.list).toHaveBeenCalled();
+			expect(response.status).toBe(400);
+		});
+
 		it('treats a KV read error as a cache miss and proceeds', async () => {
 			const kvMock = vi.mocked(env.DDNS_KV) as any;
 			kvMock.get.mockRejectedValue(new Error('KV read error'));
@@ -1436,6 +1454,31 @@ describe('Worker fetch handler', () => {
 				error: "Multiple matching records found for 'test.example.com'. Specify a unique hostname per zone.",
 			});
 		});
+
+		it('treats an empty zone param as no filter and searches all zones', async () => {
+			mockCloudflareClient.zones.list.mockResolvedValue({
+				result: [
+					{ id: 'zone1', name: 'example.com' },
+					{ id: 'zone2', name: 'test.com' },
+				],
+			} as any);
+			// Record lives in the second zone; an empty zone filter must not narrow the search.
+			mockCloudflareClient.dns.records.list.mockResolvedValueOnce({ result: [] } as any);
+			mockCloudflareClient.dns.records.list.mockResolvedValueOnce({
+				result: [{ id: 'record1', name: 'sub.test.com', type: 'A', content: '1.2.3.4' }],
+			} as any);
+			mockCloudflareClient.dns.records.update.mockResolvedValue(undefined);
+
+			const request = createMockRequest('https://example.com/update?ip4=1.2.3.5&hostnames=sub.test.com&zone=', {
+				headers: validAuth,
+			});
+
+			const response = await worker.fetch(request, env, ctx);
+
+			expect(response.status).toBe(200);
+			// The empty zone string normalises to null: both zones are searched, not filtered.
+			expect(mockCloudflareClient.dns.records.list).toHaveBeenCalledTimes(2);
+		});
 	});
 
 	// -------------------------------------------------------------------------
@@ -1766,6 +1809,32 @@ describe('Worker fetch handler', () => {
 			// Last positional argument to bind is the outcome
 			const bindArgs = stmtMock.bind.mock.calls.at(-1) as unknown[];
 			expect(bindArgs[7]).toBe('no-change');
+		});
+
+		it('records previousIp null when the existing DNS record has no content', async () => {
+			mockCloudflareClient.zones.list.mockResolvedValue({
+				result: [{ id: 'zone1', name: 'example.com' }],
+			} as any);
+			// Record exists but carries no content; previousIp must fall back to null.
+			mockCloudflareClient.dns.records.list.mockResolvedValue({
+				result: [{ id: 'r1', name: 'test.example.com', type: 'A', proxied: false, ttl: 1 }],
+			} as any);
+			mockCloudflareClient.dns.records.update.mockResolvedValue(undefined);
+
+			const request = createMockRequest('https://example.com/update?ip4=1.2.3.4&hostnames=test.example.com', {
+				headers: validAuth,
+			});
+
+			await worker.fetch(request, env, ctx);
+
+			const waitUntilArgs = (waitUntilMock.mock.calls as [Promise<void>][]).map(([p]) => p);
+			await Promise.allSettled(waitUntilArgs);
+
+			const auditDbMock = vi.mocked(env.AUDIT_DB) as any;
+			const stmtMock = auditDbMock.prepare();
+			const bindArgs = stmtMock.bind.mock.calls.at(-1) as unknown[];
+			// previousIp is the 6th positional bind arg (index 5).
+			expect(bindArgs[5]).toBeNull();
 		});
 	});
 
