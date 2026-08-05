@@ -1,4 +1,4 @@
-import { Cloudflare } from 'cloudflare';
+import { AuthenticationError, BadRequestError, Cloudflare, PermissionDeniedError } from 'cloudflare';
 import { HISTORY_DEFAULT_LIMIT, queryHistory, writeAuditEvents, type AuditEvent } from './audit';
 import { pushNtfy } from './pushNtfy';
 
@@ -298,6 +298,15 @@ async function writeCachedIp(env: Env, record: DDNSRecord): Promise<void> {
 	}
 }
 
+// A worker invocation is wall-clock bound, so the SDK defaults (60s per
+// request, 2 retries) would let one stalled call spend the whole budget.
+const API_TIMEOUT_MS = 10_000;
+const API_MAX_RETRIES = 1;
+
+function apiClient(auth: ParsedAuth): Cloudflare {
+	return new Cloudflare({ apiToken: auth.token, timeout: API_TIMEOUT_MS, maxRetries: API_MAX_RETRIES });
+}
+
 /** Verifies the token is active and returns its ID (the audit tenant key). */
 async function verifyToken(cloudflare: Cloudflare): Promise<string> {
 	let verification: { id: string; status: string };
@@ -306,7 +315,7 @@ async function verifyToken(cloudflare: Cloudflare): Promise<string> {
 	} catch (error) {
 		// An invalid or expired token makes the verify call itself fail; that
 		// is a client auth problem, not a server error.
-		if (error instanceof Cloudflare.APIError && (error.status === 400 || error.status === 401 || error.status === 403)) {
+		if (error instanceof BadRequestError || error instanceof AuthenticationError || error instanceof PermissionDeniedError) {
 			throw new HttpError(401, 'Authentication failed: invalid token.');
 		}
 		throw error;
@@ -321,6 +330,12 @@ async function verifyToken(cloudflare: Cloudflare): Promise<string> {
 // on every consecutive update. Stale entries self-heal via TTL.
 const ZONES_TTL_SECONDS = 5 * 60;
 
+// The zones endpoint caps per_page at 50; asking for the cap keeps the page
+// walk short for tokens scoped to many zones. The ceiling bounds the walk at
+// a caller-supplied token's zone count, which the worker does not control.
+const ZONE_PAGE_SIZE = 50;
+const ZONE_LIST_MAX = ZONE_PAGE_SIZE * 20;
+
 interface CachedZone {
 	id: string;
 	name: string;
@@ -330,12 +345,21 @@ function zonesCacheKey(tokenId: string): string {
 	return `zones:${tokenId}`;
 }
 
+/** Cached zones are read back as unknown: only the two fields used are trusted. */
+function isCachedZone(value: unknown): value is CachedZone {
+	if (typeof value !== 'object' || value === null) {
+		return false;
+	}
+	const zone = value as Record<string, unknown>;
+	return typeof zone['id'] === 'string' && typeof zone['name'] === 'string';
+}
+
 async function readCachedZones(env: Env, tokenId: string): Promise<CachedZone[] | null> {
 	try {
 		const raw = await env.DDNS_KV.get(zonesCacheKey(tokenId));
 		if (raw === null) return null;
 		const parsed = JSON.parse(raw) as unknown;
-		return Array.isArray(parsed) ? (parsed as CachedZone[]) : null;
+		return Array.isArray(parsed) && parsed.every(isCachedZone) ? parsed : null;
 	} catch (error) {
 		console.error(`Failed to read zones cache for token ${tokenId}:`, error);
 		return null;
@@ -357,6 +381,26 @@ interface ProcessedRecord {
 	message: string | null;
 }
 
+// One page covers every record sharing an exact name and type; a hostname
+// with more A records than this is not a DDNS target.
+const RECORD_PAGE_SIZE = 100;
+
+/**
+ * The zones that could hold a record for `hostname`, by DNS containment.
+ *
+ * The caller supplies the token, so the zone count is caller-controlled and
+ * unbounded. Narrowing before the per-zone lookup keeps one update request
+ * costing a fixed handful of API calls rather than one per zone on the token.
+ * Comparison is lowercased because DNS names are case-insensitive.
+ */
+function zonesHosting(zones: CachedZone[], hostname: string): CachedZone[] {
+	const name = hostname.toLowerCase();
+	return zones.filter((zone) => {
+		const zoneName = zone.name.toLowerCase();
+		return name === zoneName || name.endsWith(`.${zoneName}`);
+	});
+}
+
 /**
  * Looks up, compares, and (when the DNS content differs) updates one record.
  * Zone lookups run in parallel. Throws HttpError on no/ambiguous matches;
@@ -372,12 +416,17 @@ async function processRecord(
 	callerIp: string | null,
 	tokenId: string,
 ): Promise<ProcessedRecord> {
+	const candidates = zonesHosting(zones, record.name);
 	const lists = await Promise.all(
-		zones.map(async (zone) => {
+		candidates.map(async (zone) => {
+			// Awaited, not iterated: the SDK's page iterator stops only after
+			// fetching an empty page, so draining costs one wasted call every
+			// time. One page of RECORD_PAGE_SIZE covers an exact name+type.
 			const { result } = await cloudflare.dns.records.list({
 				zone_id: zone.id,
-				name: record.name as Cloudflare.DNS.Records.RecordListParams.Name,
+				name: { exact: record.name },
 				type: record.type,
+				per_page: RECORD_PAGE_SIZE,
 			});
 			return { zone, result };
 		}),
@@ -452,7 +501,7 @@ async function updateHostnames(
 	ctx: ExecutionContext,
 ): Promise<Response> {
 	const { records, zoneFilter, ntfyUrl } = updateRequest;
-	const cloudflare = new Cloudflare({ apiToken: auth.token });
+	const cloudflare = apiClient(auth);
 
 	// Cache reads are KV-only and decide whether any API work exists at all.
 	const cachedIps = await Promise.all(records.map(async (record) => readCachedIp(env, record)));
@@ -489,12 +538,26 @@ async function updateHostnames(
 
 	let zones = await readCachedZones(env, tokenId);
 	if (zones === null) {
-		const { result } = await cloudflare.zones.list();
-		zones = result.map((zone) => ({ id: zone.id, name: zone.name }));
-		ctx.waitUntil(writeCachedZones(env, tokenId, zones));
+		// Every zone the token can see, not just the first page: a hostname in
+		// zone 21+ would otherwise report as having no matching record. The
+		// result is cached per token, so the page walk is rare.
+		const discovered: CachedZone[] = [];
+		for await (const zone of cloudflare.zones.list({ per_page: ZONE_PAGE_SIZE })) {
+			discovered.push({ id: zone.id, name: zone.name });
+			if (discovered.length >= ZONE_LIST_MAX) {
+				console.warn(`Token ${tokenId} sees more than ${String(ZONE_LIST_MAX)} zones; searching only the first ${String(ZONE_LIST_MAX)}.`);
+				break;
+			}
+		}
+		zones = discovered;
+		ctx.waitUntil(writeCachedZones(env, tokenId, discovered));
 	}
 	if (zoneFilter !== null) {
-		zones = zones.filter((zone) => zone.name === zoneFilter);
+		// Lowercased on both sides, matching zonesHosting: DNS names are
+		// case-insensitive, and a case mismatch here would read as a token
+		// permissions problem.
+		const wanted = zoneFilter.toLowerCase();
+		zones = zones.filter((zone) => zone.name.toLowerCase() === wanted);
 		if (zones.length === 0) {
 			throw new HttpError(400, `Zone '${zoneFilter}' not available with current permissions.`);
 		}
@@ -543,7 +606,7 @@ async function updateHostnames(
 
 /** GET /history: the caller's own audit rows, newest first. */
 async function handleHistory(auth: ParsedAuth, request: Request, env: Env): Promise<Response> {
-	const cloudflare = new Cloudflare({ apiToken: auth.token });
+	const cloudflare = apiClient(auth);
 	const tokenId = await verifyToken(cloudflare);
 
 	const { searchParams } = new URL(request.url);
