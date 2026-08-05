@@ -772,6 +772,48 @@ describe('Worker fetch handler', () => {
 			expect(mockCloudflareClient.dns.records.update).toHaveBeenCalledTimes(1);
 		});
 
+		// Query parameters arrive percent-decoded, so an unchecked hostname
+		// carries whatever the caller encoded into the log lines that quote it.
+		it.each([
+			['an embedded newline', 'a%0AFAKE-LOG-LINE'],
+			['a space', 'has%20space.example.com'],
+			['a leading dot', '.example.com'],
+			['a mid-label wildcard', 'a.*.example.com'],
+			['an underscore', 'under_score.example.com'],
+		])('rejects a hostname with %s', async (_label, encoded) => {
+			const request = createMockRequest(`https://example.com/update?ip4=1.2.3.4&hostnames=${encoded}`, {
+				headers: validAuth,
+			});
+
+			const response = await worker.fetch(request, env, ctx);
+
+			expect(response.status).toBe(422);
+			const body = (await response.json()) as any;
+			expect(body.error).toContain('Not a valid hostname');
+			// The echoed name is re-encoded, so a newline cannot break the line.
+			expect(body.error).not.toContain('\n');
+		});
+
+		it.each([
+			['a plain fqdn', 'test.example.com'],
+			['a wildcard', '*.example.com'],
+			['a zone apex', 'example.com'],
+			['a punycode idn', 'xn--bcher-kva.example.com'],
+			['a hyphenated label', 'my-host-1.example.com'],
+		])('accepts %s', async (_label, hostname) => {
+			mockCloudflareClient.zones.list.mockReturnValue(mockPage({ result: [] }));
+
+			const request = createMockRequest(`https://example.com/update?ip4=1.2.3.4&hostnames=${encodeURIComponent(hostname)}`, {
+				headers: validAuth,
+			});
+
+			const response = await worker.fetch(request, env, ctx);
+			const body = (await response.json()) as any;
+
+			// Refused later for having no zones, never for its shape.
+			expect(body.error).not.toContain('Not a valid hostname');
+		});
+
 		it('rejects a hostname longer than a DNS name may be', async () => {
 			// An over-long name also pushes the KV cache key past its own limit.
 			const hostname = `${'a'.repeat(250)}.example.com`;
@@ -2218,6 +2260,153 @@ describe('Worker fetch handler', () => {
 			await worker.fetch(request, env, ctx);
 
 			expect(waitUntilMock).not.toHaveBeenCalled();
+		});
+
+		it('audits and notifies the records that landed even when a sibling record fails', async () => {
+			// Records are processed concurrently, so a refusal on one arrives
+			// after another has already changed DNS. That change is real and must
+			// not vanish from the audit trail because the response is an error.
+			const { pushNtfy } = await import('../src/pushNtfy');
+			const pushNtfyMock = vi.mocked(pushNtfy);
+			mockCloudflareClient.zones.list.mockReturnValue(mockPage({ result: [{ id: 'zone1', name: 'example.com' }] }));
+			// good.example.com resolves and changes; missing.example.com does not exist.
+			mockCloudflareClient.dns.records.list.mockImplementation((params: any) =>
+				params.name.exact === 'good.example.com'
+					? mockPage({ result: [{ id: 'r1', name: 'good.example.com', type: 'A', content: '1.2.3.0', proxied: false, ttl: 1 }] })
+					: mockPage({ result: [] }),
+			);
+			mockCloudflareClient.dns.records.update.mockResolvedValue(undefined);
+
+			const request = createMockRequest('https://example.com/update?ip4=1.2.3.4&hostnames=good.example.com,missing.example.com', {
+				headers: { ...validAuth, 'CF-Connecting-IP': '5.6.7.8' },
+			});
+
+			const response = await worker.fetch(request, env, ctx);
+
+			// The request is still refused: one hostname could not be updated.
+			expect(response.status).toBe(400);
+			const body = (await response.json()) as any;
+			expect(body.error).toContain("No matching record found for 'missing.example.com'");
+
+			// The DNS change that did land was applied, so it must be recorded.
+			expect(mockCloudflareClient.dns.records.update).toHaveBeenCalledWith('r1', expect.objectContaining({ content: '1.2.3.4' }));
+
+			const waitUntilArgs = (waitUntilMock.mock.calls as [Promise<void>][]).map(([p]) => p);
+			await Promise.allSettled(waitUntilArgs);
+
+			const auditDbMock = vi.mocked(env.AUDIT_DB) as any;
+			expect(auditDbMock.batch).toHaveBeenCalledTimes(1);
+			const [batchArg] = auditDbMock.batch.mock.calls[0] as [unknown[]];
+			expect(batchArg).toHaveLength(1);
+			expect(auditDbMock.prepare().bind).toHaveBeenCalledWith(
+				expect.stringMatching(/^\d{4}-\d{2}-\d{2}T/),
+				'token-id-123',
+				'5.6.7.8',
+				'good.example.com',
+				'A',
+				'1.2.3.0',
+				'1.2.3.4',
+				'updated',
+			);
+			expect(pushNtfyMock).toHaveBeenCalledWith([expect.stringContaining('good.example.com')], null);
+		});
+
+		it('reports the records that landed in the error body', async () => {
+			// A caller that reads only the status would otherwise conclude
+			// nothing changed while its sibling record was repointed.
+			mockCloudflareClient.zones.list.mockReturnValue(mockPage({ result: [{ id: 'zone1', name: 'example.com' }] }));
+			mockCloudflareClient.dns.records.list.mockImplementation((params: any) =>
+				params.name.exact === 'good.example.com'
+					? mockPage({ result: [{ id: 'r1', name: 'good.example.com', type: 'A', content: '1.2.3.0', proxied: false, ttl: 1 }] })
+					: mockPage({ result: [] }),
+			);
+			mockCloudflareClient.dns.records.update.mockResolvedValue(undefined);
+
+			const request = createMockRequest('https://example.com/update?ip4=1.2.3.4&hostnames=good.example.com,missing.example.com', {
+				headers: validAuth,
+			});
+
+			const response = await worker.fetch(request, env, ctx);
+			const body = (await response.json()) as any;
+
+			expect(response.status).toBe(400);
+			expect(body.success).toBe(false);
+			expect(body.data).toEqual({
+				updated: true,
+				records: [{ hostname: 'good.example.com', type: 'A', ip: '1.2.3.4', updated: true }],
+			});
+		});
+
+		it('surfaces the actionable refusal rather than a transient failure on an earlier record', async () => {
+			// find() scans by index, so an early transport error would mask a
+			// later 400. A 5xx is also what a DDNS client retries against, so
+			// the caller would loop on a permanent misconfiguration.
+			mockCloudflareClient.zones.list.mockReturnValue(mockPage({ result: [{ id: 'zone1', name: 'example.com' }] }));
+			mockCloudflareClient.dns.records.list.mockImplementation((params: any) => {
+				if (params.name.exact === 'aaa.example.com') {
+					return { then: (_r: any, reject: any) => reject(new MockInternalServerError()) };
+				}
+				return mockPage({ result: [] });
+			});
+
+			const request = createMockRequest('https://example.com/update?ip4=1.2.3.4&hostnames=aaa.example.com,zzz.example.com', {
+				headers: validAuth,
+			});
+
+			const response = await worker.fetch(request, env, ctx);
+			const body = (await response.json()) as any;
+
+			expect(response.status).toBe(400);
+			expect(body.error).toContain("No matching record found for 'zzz.example.com'");
+		});
+
+		it('returns 500 when every failure is a transport error', async () => {
+			mockCloudflareClient.zones.list.mockReturnValue(mockPage({ result: [{ id: 'zone1', name: 'example.com' }] }));
+			mockCloudflareClient.dns.records.list.mockImplementation(() => ({
+				then: (_r: any, reject: any) => reject(new MockInternalServerError()),
+			}));
+
+			const request = createMockRequest('https://example.com/update?ip4=1.2.3.4&hostnames=a.example.com', {
+				headers: validAuth,
+			});
+
+			const response = await worker.fetch(request, env, ctx);
+			const body = (await response.json()) as any;
+
+			expect(response.status).toBe(500);
+			expect(body).toEqual({ success: false, error: 'Internal Server Error' });
+		});
+
+		it('logs every failure in a batch, not only the one it reports', async () => {
+			const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+			mockCloudflareClient.zones.list.mockReturnValue(mockPage({ result: [{ id: 'zone1', name: 'example.com' }] }));
+			mockCloudflareClient.dns.records.list.mockReturnValue(mockPage({ result: [] }));
+
+			const request = createMockRequest('https://example.com/update?ip4=1.2.3.4&hostnames=a.example.com,b.example.com,c.example.com', {
+				headers: validAuth,
+			});
+
+			await worker.fetch(request, env, ctx);
+
+			const failureLogs = errorSpy.mock.calls.filter(([msg]) => msg === 'Record update failed:');
+			expect(failureLogs).toHaveLength(3);
+		});
+
+		it('writes no audit batch when every record in the request fails', async () => {
+			mockCloudflareClient.zones.list.mockReturnValue(mockPage({ result: [{ id: 'zone1', name: 'example.com' }] }));
+			mockCloudflareClient.dns.records.list.mockReturnValue(mockPage({ result: [] }));
+
+			const request = createMockRequest('https://example.com/update?ip4=1.2.3.4&hostnames=a.example.com,b.example.com', {
+				headers: validAuth,
+			});
+
+			const response = await worker.fetch(request, env, ctx);
+
+			expect(response.status).toBe(400);
+			const waitUntilArgs = (waitUntilMock.mock.calls as [Promise<void>][]).map(([p]) => p);
+			await Promise.allSettled(waitUntilArgs);
+			// Nothing reached DNS, so there is nothing to audit.
+			expect((vi.mocked(env.AUDIT_DB) as any).batch).not.toHaveBeenCalled();
 		});
 
 		it('passes one correctly-shaped audit event to AUDIT_DB.batch per record that reached DNS', async () => {
