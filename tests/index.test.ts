@@ -437,22 +437,28 @@ describe('Worker fetch handler', () => {
 			expect(order).toEqual(['verify']);
 		});
 
-		it('answers a full cache hit with no API call when ACCESS_KEY is set', async () => {
-			// The gate already authenticated the caller, so the cached fast path
-			// stays free of Cloudflare calls.
+		it('does not serve one token a cache entry another token wrote', async () => {
+			// A shared ACCESS_KEY is one deployment secret, not a per-caller
+			// identity, so without partitioning the fast path would confirm a
+			// cached IP to anyone holding it. For a proxied record that value is
+			// the origin address.
 			env.ACCESS_KEY = 'secret-key';
-			(vi.mocked(env.DDNS_KV) as any).get.mockResolvedValue(JSON.stringify({ ip: '1.2.3.4', updatedAt: '2024-01-01T00:00:00.000Z' }));
+			const victimKey = 'ip:victim-token:vpn.example.com:A';
+			const storage = new Map([[victimKey, JSON.stringify({ ip: '203.0.113.77', updatedAt: '2024-01-01T00:00:00.000Z' })]]);
+			(vi.mocked(env.DDNS_KV) as any).get.mockImplementation((key: string) => Promise.resolve(storage.get(key) ?? null));
+			mockCloudflareClient.user.tokens.verify.mockResolvedValue({ id: 'attacker-token', status: 'active' } as any);
+			mockCloudflareClient.zones.list.mockReturnValue(mockPage({ result: [] }));
 
-			const request = createMockRequest('https://example.com/update?ip4=1.2.3.4&hostnames=test.example.com', {
-				headers: { Authorization: createAuthHeader('secret-key', 'token') },
+			const request = createMockRequest('https://example.com/update?ip4=203.0.113.77&hostnames=vpn.example.com', {
+				headers: { Authorization: createAuthHeader('secret-key', 'attacker-cf-token') },
 			});
 
 			const response = await worker.fetch(request, env, ctx);
 
-			expect(response.status).toBe(200);
-			const body = (await response.json()) as any;
-			expect(body.message).toBe('No IP change detected');
-			expect(mockCloudflareClient.user.tokens.verify).not.toHaveBeenCalled();
+			// A correct IP guess must not come back as the cached-and-current 200.
+			expect(response.status).toBe(400);
+			expect((vi.mocked(env.DDNS_KV) as any).get).toHaveBeenCalledWith('ip:attacker-token:vpn.example.com:A');
+			expect((vi.mocked(env.DDNS_KV) as any).get).not.toHaveBeenCalledWith(victimKey);
 		});
 
 		it('passes through when ACCESS_KEY is empty (open mode)', async () => {
@@ -1140,7 +1146,7 @@ describe('Worker fetch handler', () => {
 		});
 
 		// Gate ON (ACCESS_KEY non-empty): fast-path check runs before verify.
-		it('skips zone listing and tokens.verify when ALL records match cached IPs (gate on)', async () => {
+		it('stops at the token check when ALL records match cached IPs (gate on)', async () => {
 			env.ACCESS_KEY = 'gate-key';
 			const kvMock = vi.mocked(env.DDNS_KV) as any;
 			kvMock.get.mockResolvedValue(JSON.stringify({ ip: '1.2.3.4', updatedAt: '2024-01-01T00:00:00.000Z' }));
@@ -1161,12 +1167,14 @@ describe('Worker fetch handler', () => {
 					records: [{ hostname: 'test.example.com', type: 'A', ip: '1.2.3.4', updated: false }],
 				},
 			});
+			// The token check names the cache partition, so it is the one call a
+			// full cache hit still makes. Nothing beyond it runs.
+			expect(mockCloudflareClient.user.tokens.verify).toHaveBeenCalledTimes(1);
 			expect(mockCloudflareClient.zones.list).not.toHaveBeenCalled();
-			// Gate is on: verify must NOT be called on a full cache hit
-			expect(mockCloudflareClient.user.tokens.verify).not.toHaveBeenCalled();
+			expect(mockCloudflareClient.dns.records.list).not.toHaveBeenCalled();
 		});
 
-		it('uses cache key ip:<hostname>:<type>', async () => {
+		it('uses cache key ip:<tokenId>:<hostname>:<type>', async () => {
 			const kvMock = vi.mocked(env.DDNS_KV) as any;
 			kvMock.get.mockResolvedValue(null);
 			kvMock.put.mockResolvedValue(undefined);
@@ -1189,8 +1197,8 @@ describe('Worker fetch handler', () => {
 
 			await worker.fetch(request, env, ctx);
 
-			expect(kvMock.get).toHaveBeenCalledWith('ip:test.example.com:A');
-			expect(kvMock.put).toHaveBeenCalledWith('ip:test.example.com:A', expect.any(String), { expirationTtl: 2592000 });
+			expect(kvMock.get).toHaveBeenCalledWith('ip:tid:test.example.com:A');
+			expect(kvMock.put).toHaveBeenCalledWith('ip:tid:test.example.com:A', expect.any(String), { expirationTtl: 2592000 });
 		});
 
 		it('writes JSON {ip, updatedAt} to KV with expirationTtl 2592000', async () => {
@@ -2584,12 +2592,12 @@ describe('Worker fetch handler', () => {
 			});
 
 			// Verify all pipeline steps ran
-			expect(kvMock.get).toHaveBeenCalledWith('ip:test.example.com:A');
+			expect(kvMock.get).toHaveBeenCalledWith('ip:token-id-123:test.example.com:A');
 			expect(mockCloudflareClient.user.tokens.verify).toHaveBeenCalled();
 			expect(mockCloudflareClient.zones.list).toHaveBeenCalled();
 			expect(mockCloudflareClient.dns.records.list).toHaveBeenCalled();
 			expect(mockCloudflareClient.dns.records.update).toHaveBeenCalled();
-			expect(kvMock.put).toHaveBeenCalledWith('ip:test.example.com:A', expect.any(String), { expirationTtl: 2592000 });
+			expect(kvMock.put).toHaveBeenCalledWith('ip:token-id-123:test.example.com:A', expect.any(String), { expirationTtl: 2592000 });
 			expect(waitUntilMock).toHaveBeenCalled();
 
 			// pushNtfy called after resolving waitUntil promises

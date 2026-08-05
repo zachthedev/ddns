@@ -73,8 +73,14 @@ interface CachedIp {
 	updatedAt: string;
 }
 
-function cacheKey(record: DDNSRecord): string {
-	return `${KV_KEY_PREFIX}:${record.name}:${record.type}`;
+/**
+ * Cache keys carry the token ID so a caller only ever reads back entries
+ * their own token wrote. A hostname-only key would let any valid token read
+ * the cached IP for a name it has no authority over, which for a proxied
+ * record is the origin address rather than anything DNS would resolve.
+ */
+function cacheKey(tokenId: string, record: DDNSRecord): string {
+	return `${KV_KEY_PREFIX}:${tokenId}:${record.name}:${record.type}`;
 }
 
 export class HttpError extends Error {
@@ -305,25 +311,27 @@ function constructDNSRecords(request: Request): UpdateRequest {
 }
 
 /** Reads a record's cached IP; any failure or unparseable entry is a miss. */
-async function readCachedIp(env: Env, record: DDNSRecord): Promise<string | null> {
+async function readCachedIp(env: Env, tokenId: string, record: DDNSRecord): Promise<string | null> {
+	const key = cacheKey(tokenId, record);
 	try {
-		const raw = await env.DDNS_KV.get(cacheKey(record));
+		const raw = await env.DDNS_KV.get(key);
 		if (raw === null) return null;
 		const parsed = JSON.parse(raw) as Partial<CachedIp>;
 		return typeof parsed.ip === 'string' ? parsed.ip : null;
 	} catch (error) {
-		console.error(`Failed to read IP cache for ${cacheKey(record)}:`, error);
+		console.error(`Failed to read IP cache for ${key}:`, error);
 		return null;
 	}
 }
 
 /** Caches a record's IP with a TTL so stale entries clean themselves up. */
-async function writeCachedIp(env: Env, record: DDNSRecord): Promise<void> {
+async function writeCachedIp(env: Env, tokenId: string, record: DDNSRecord): Promise<void> {
 	const value: CachedIp = { ip: record.content, updatedAt: new Date().toISOString() };
+	const key = cacheKey(tokenId, record);
 	try {
-		await env.DDNS_KV.put(cacheKey(record), JSON.stringify(value), { expirationTtl: KV_TTL_SECONDS });
+		await env.DDNS_KV.put(key, JSON.stringify(value), { expirationTtl: KV_TTL_SECONDS });
 	} catch (error) {
-		console.error(`Failed to write IP cache for ${cacheKey(record)}:`, error);
+		console.error(`Failed to write IP cache for ${key}:`, error);
 		// The cache is an optimization; the update already succeeded.
 	}
 }
@@ -510,7 +518,7 @@ async function processRecord(
 		console.log(`DNS record for '${record.name}' ('${record.type}') already at '${record.content}'. Refreshing cache only.`);
 	}
 
-	await writeCachedIp(env, record);
+	await writeCachedIp(env, tokenId, record);
 	return {
 		record,
 		result: { hostname: record.name, type: record.type, ip: record.content, updated: changed },
@@ -538,19 +546,14 @@ async function updateHostnames(
 	const { records, zoneFilter, ntfyUrl } = updateRequest;
 	const cloudflare = apiClient(auth);
 
-	// With the gate off the token is the only credential, so it is verified
-	// before any KV work: an unverified caller costs one API call, not one KV
-	// read per record. With the gate on, ACCESS_KEY has already filtered
-	// strangers, so a full cache hit answers with zero Cloudflare API calls.
-	//
-	// ACCESS_KEY is one shared deployment secret, not a per-caller identity,
-	// and the IP cache is keyed by hostname alone. Anyone holding it can
-	// therefore confirm a cached IP for a hostname they do not control. The
-	// fast path also stays unaudited by design, because nothing was touched.
-	const gated = Boolean(env.ACCESS_KEY);
-	let tokenId = gated ? null : await verifyToken(cloudflare);
+	// Verification comes first on every path: it names the cache partition, and
+	// it keeps an unverified caller at one API call rather than one KV read per
+	// record. The cached fast path below therefore costs one verify call, which
+	// is the price of never serving one caller's cache entry to another.
+	// That path stays unaudited by design, because nothing was touched.
+	const tokenId = await verifyToken(cloudflare);
 
-	const cachedIps = await Promise.all(records.map(async (record) => readCachedIp(env, record)));
+	const cachedIps = await Promise.all(records.map(async (record) => readCachedIp(env, tokenId, record)));
 	const pending = records.filter((record, i) => cachedIps[i] !== record.content);
 
 	const allCurrentResponse = (): Response => {
@@ -571,8 +574,6 @@ async function updateHostnames(
 	if (pending.length === 0) {
 		return allCurrentResponse();
 	}
-
-	tokenId ??= await verifyToken(cloudflare);
 
 	let zones = await readCachedZones(env, tokenId);
 	if (zones === null) {
