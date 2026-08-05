@@ -23,6 +23,19 @@ interface UpdateRequest {
 
 const NTFY_URL_MAX_LENGTH = 512;
 
+// The bound is on records, not hostnames, because the ip4 and ip6 slots each
+// turn one hostname into a record and the cost follows records. One record
+// spends a KV read, a records.list per candidate zone, an update when the IP
+// moved, and a KV write, so 40 stays inside the 1000 subrequest ceiling even
+// with several nested zones on the token. Batches this size need the paid
+// plan; the free ceiling of 50 subrequests fits roughly six records.
+const RECORDS_MAX = 40;
+
+// RFC 1035: 253 characters for a full domain name. An over-long name also
+// pushes the KV key past its own limit, which turns the cache into a
+// permanent miss for that record.
+const HOSTNAME_MAX_LENGTH = 253;
+
 /**
  * Validates the caller-supplied ntfy URL. Any https endpoint is allowed
  * (self-hosted servers included): the notification body is worker-built
@@ -252,12 +265,23 @@ function constructDNSRecords(request: Request): UpdateRequest {
 	if (hostnameParam === null || hostnameParam === '') {
 		throw new HttpError(422, "Missing 'hostnames' parameter.");
 	}
-	const hostnames = hostnameParam
-		.split(',')
-		.map((s) => s.trim())
-		.filter(Boolean);
+	// Deduplicated: a repeated hostname would otherwise fan out into one
+	// concurrent update per copy, all racing the same record, and file an
+	// audit row per copy for a single logical change.
+	const hostnames = [
+		...new Set(
+			hostnameParam
+				.split(',')
+				.map((s) => s.trim())
+				.filter(Boolean),
+		),
+	];
 	if (hostnames.length === 0) {
 		throw new HttpError(422, 'No hostnames provided.');
+	}
+	const overlong = hostnames.find((hostname) => hostname.length > HOSTNAME_MAX_LENGTH);
+	if (overlong !== undefined) {
+		throw new HttpError(422, `Hostname exceeds ${String(HOSTNAME_MAX_LENGTH)} characters: '${overlong.slice(0, 60)}...'`);
 	}
 
 	// Per hostname: an A record when ip4 resolved, an AAAA when ip6 did.
@@ -269,6 +293,12 @@ function constructDNSRecords(request: Request): UpdateRequest {
 		if (v6 !== null) {
 			records.push({ content: v6, name: hostname, type: 'AAAA', ttl: 1 });
 		}
+	}
+	if (records.length > RECORDS_MAX) {
+		throw new HttpError(
+			422,
+			`Too many DNS records: ${String(records.length)} requested, ${String(RECORDS_MAX)} allowed per request. Each hostname counts once per IP family.`,
+		);
 	}
 
 	return { records, zoneFilter: zoneFilter === '' ? null : zoneFilter, ntfyUrl };
@@ -322,6 +352,11 @@ async function verifyToken(cloudflare: Cloudflare): Promise<string> {
 	}
 	if (verification.status !== 'active') {
 		throw new HttpError(401, `Authentication failed: token ${verification.status}`);
+	}
+	// The ID keys the zone cache and the audit rows' tenant column, so an
+	// absent or empty one would pool separate tenants under a shared key.
+	if (typeof verification.id !== 'string' || verification.id === '') {
+		throw new HttpError(401, 'Authentication failed: token has no identity.');
 	}
 	return verification.id;
 }
@@ -503,7 +538,18 @@ async function updateHostnames(
 	const { records, zoneFilter, ntfyUrl } = updateRequest;
 	const cloudflare = apiClient(auth);
 
-	// Cache reads are KV-only and decide whether any API work exists at all.
+	// With the gate off the token is the only credential, so it is verified
+	// before any KV work: an unverified caller costs one API call, not one KV
+	// read per record. With the gate on, ACCESS_KEY has already filtered
+	// strangers, so a full cache hit answers with zero Cloudflare API calls.
+	//
+	// ACCESS_KEY is one shared deployment secret, not a per-caller identity,
+	// and the IP cache is keyed by hostname alone. Anyone holding it can
+	// therefore confirm a cached IP for a hostname they do not control. The
+	// fast path also stays unaudited by design, because nothing was touched.
+	const gated = Boolean(env.ACCESS_KEY);
+	let tokenId = gated ? null : await verifyToken(cloudflare);
+
 	const cachedIps = await Promise.all(records.map(async (record) => readCachedIp(env, record)));
 	const pending = records.filter((record, i) => cachedIps[i] !== record.content);
 
@@ -522,19 +568,11 @@ async function updateHostnames(
 		);
 	};
 
-	// With the access gate on, the caller is already authenticated, so a full
-	// cache hit answers with ZERO Cloudflare API calls. Without the gate,
-	// verify first so unauthenticated probes can't use the fast path as an
-	// oracle. The fast path stays unaudited by design: nothing was touched.
-	const gated = Boolean(env.ACCESS_KEY);
-	if (gated && pending.length === 0) {
-		return allCurrentResponse();
-	}
-
-	const tokenId = await verifyToken(cloudflare);
 	if (pending.length === 0) {
 		return allCurrentResponse();
 	}
+
+	tokenId ??= await verifyToken(cloudflare);
 
 	let zones = await readCachedZones(env, tokenId);
 	if (zones === null) {

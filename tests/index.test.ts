@@ -413,6 +413,48 @@ describe('Worker fetch handler', () => {
 	// -------------------------------------------------------------------------
 
 	describe('Access gate', () => {
+		it('verifies the token before touching KV when no ACCESS_KEY is set', async () => {
+			// The token is the only credential in open mode, so an unverified
+			// caller must not be able to spend a KV read per hostname first.
+			env.ACCESS_KEY = '';
+			const order: string[] = [];
+			mockCloudflareClient.user.tokens.verify.mockImplementation(() => {
+				order.push('verify');
+				return Promise.reject(new MockAuthenticationError());
+			});
+			(vi.mocked(env.DDNS_KV) as any).get.mockImplementation(() => {
+				order.push('kv');
+				return Promise.resolve(null);
+			});
+
+			const request = createMockRequest('https://example.com/update?ip4=1.2.3.4&hostnames=a.example.com,b.example.com', {
+				headers: { Authorization: createAuthHeader('user', 'token') },
+			});
+
+			const response = await worker.fetch(request, env, ctx);
+
+			expect(response.status).toBe(401);
+			expect(order).toEqual(['verify']);
+		});
+
+		it('answers a full cache hit with no API call when ACCESS_KEY is set', async () => {
+			// The gate already authenticated the caller, so the cached fast path
+			// stays free of Cloudflare calls.
+			env.ACCESS_KEY = 'secret-key';
+			(vi.mocked(env.DDNS_KV) as any).get.mockResolvedValue(JSON.stringify({ ip: '1.2.3.4', updatedAt: '2024-01-01T00:00:00.000Z' }));
+
+			const request = createMockRequest('https://example.com/update?ip4=1.2.3.4&hostnames=test.example.com', {
+				headers: { Authorization: createAuthHeader('secret-key', 'token') },
+			});
+
+			const response = await worker.fetch(request, env, ctx);
+
+			expect(response.status).toBe(200);
+			const body = (await response.json()) as any;
+			expect(body.message).toBe('No IP change detected');
+			expect(mockCloudflareClient.user.tokens.verify).not.toHaveBeenCalled();
+		});
+
 		it('passes through when ACCESS_KEY is empty (open mode)', async () => {
 			env.ACCESS_KEY = '';
 			mockCloudflareClient.user.tokens.verify.mockResolvedValue({ id: 'tid', status: 'active' } as any);
@@ -662,6 +704,84 @@ describe('Worker fetch handler', () => {
 			});
 		});
 
+		// The ceiling is on records, since each IP family turns one hostname
+		// into a record and every record carries its own fan-out cost.
+		it.each([
+			['single family at the ceiling', 40, 'ip4=1.2.3.4'],
+			['dual stack at the ceiling', 20, 'ip4=1.2.3.4&ip6=2001:db8::1'],
+		])('accepts %s', async (_label, count, ipParams) => {
+			const hostnames = Array.from({ length: count }, (_, i) => `h${String(i)}.example.com`).join(',');
+			mockCloudflareClient.zones.list.mockReturnValue(mockPage({ result: [{ id: 'zone1', name: 'example.com' }] }));
+			mockCloudflareClient.dns.records.list.mockReturnValue(mockPage({ result: [] }));
+
+			const request = createMockRequest(`https://example.com/update?${ipParams}&hostnames=${hostnames}`, {
+				headers: validAuth,
+			});
+
+			const response = await worker.fetch(request, env, ctx);
+			const body = (await response.json()) as any;
+
+			// Refused for having no matching record, not for its size.
+			expect(response.status).toBe(400);
+			expect(body.error).toContain('No matching record found');
+		});
+
+		it.each([
+			['single family', 41, 'ip4=1.2.3.4', 41],
+			['dual stack', 21, 'ip4=1.2.3.4&ip6=2001:db8::1', 42],
+		])('rejects %s past the record ceiling before spending a KV read', async (_label, count, ipParams, records) => {
+			const hostnames = Array.from({ length: count }, (_, i) => `h${String(i)}.example.com`).join(',');
+
+			const request = createMockRequest(`https://example.com/update?${ipParams}&hostnames=${hostnames}`, {
+				headers: validAuth,
+			});
+
+			const response = await worker.fetch(request, env, ctx);
+
+			expect(response.status).toBe(422);
+			const body = (await response.json()) as any;
+			expect(body).toEqual({
+				success: false,
+				error: `Too many DNS records: ${String(records)} requested, 40 allowed per request. Each hostname counts once per IP family.`,
+			});
+			expect((vi.mocked(env.DDNS_KV) as any).get).not.toHaveBeenCalled();
+		});
+
+		it('collapses a repeated hostname into one record', async () => {
+			// Undeduplicated, each copy races the same DNS record with its own
+			// update call and files its own audit row for one logical change.
+			const hostnames = Array.from({ length: 30 }, () => 'test.example.com').join(',');
+			wireStandardHappyPath(mockCloudflareClient);
+			(vi.mocked(env.DDNS_KV) as any).get.mockResolvedValue(null);
+
+			const request = createMockRequest(`https://example.com/update?ip4=1.2.3.5&hostnames=${hostnames}`, {
+				headers: validAuth,
+			});
+
+			const response = await worker.fetch(request, env, ctx);
+			const body = (await response.json()) as any;
+
+			expect(response.status).toBe(200);
+			expect(body.data.records).toHaveLength(1);
+			expect(mockCloudflareClient.dns.records.update).toHaveBeenCalledTimes(1);
+		});
+
+		it('rejects a hostname longer than a DNS name may be', async () => {
+			// An over-long name also pushes the KV cache key past its own limit.
+			const hostname = `${'a'.repeat(250)}.example.com`;
+
+			const request = createMockRequest(`https://example.com/update?ip4=1.2.3.4&hostnames=${hostname}`, {
+				headers: validAuth,
+			});
+
+			const response = await worker.fetch(request, env, ctx);
+
+			expect(response.status).toBe(422);
+			const body = (await response.json()) as any;
+			expect(body.error).toContain('exceeds 253 characters');
+			expect((vi.mocked(env.DDNS_KV) as any).get).not.toHaveBeenCalled();
+		});
+
 		it('trims whitespace from ip4 parameter', async () => {
 			mockCloudflareClient.zones.list.mockReturnValue(
 				mockPage({
@@ -881,6 +1001,30 @@ describe('Worker fetch handler', () => {
 				success: false,
 				error: 'Authentication failed: token expired',
 			});
+		});
+
+		// The ID keys the zone cache and the audit rows' tenant column, so an
+		// active token without one must not reach either.
+		it.each([
+			['a missing id', { status: 'active' }],
+			['an empty id', { id: '', status: 'active' }],
+			['a non-string id', { id: 12345, status: 'active' }],
+		])('returns 401 when tokens.verify returns %s', async (_label, verification) => {
+			mockCloudflareClient.user.tokens.verify.mockResolvedValue(verification as any);
+
+			const request = createMockRequest('https://example.com/update?ip4=1.2.3.4&hostnames=test.example.com', {
+				headers: validAuth,
+			});
+
+			const response = await worker.fetch(request, env, ctx);
+
+			expect(response.status).toBe(401);
+			const body = (await response.json()) as any;
+			expect(body).toEqual({
+				success: false,
+				error: 'Authentication failed: token has no identity.',
+			});
+			expect(mockCloudflareClient.zones.list).not.toHaveBeenCalled();
 		});
 
 		it('returns 401 when tokens.verify rejects with a BadRequestError', async () => {

@@ -94,7 +94,7 @@ injected at deploy time from the environment.
    - **Username:** Your `ACCESS_KEY` if you configured one (recommended); any value otherwise (the field is never used for authentication)
    - **Password:** Cloudflare User API Token scoped to DNS edit _(not an Account API Token)_
    - **Server:** `<worker-name>.<worker-subdomain>.workers.dev/update?ip4=%i&ip6=auto&hostnames=%h`
-     _(Omit `https://`. Comma-separate to update several records at once: `hostnames=example.com,*.example.com`. `ip4`/`ip6` each accept a literal address or `auto`, which uses the connecting IP when it matches that family and skips the slot otherwise; provide at least one. Optional `zone=example.com` restricts matching to one zone. Optional `ntfy=` sends change notifications to your ntfy server, pasted raw: `ntfy=https://ntfy.sh/my-topic`. Do not percent-encode it; inadyn treats `%` sequences as its own substitution variables.)_
+     _(Omit `https://`. Comma-separate to update several records at once: `hostnames=example.com,*.example.com`. A request carries up to 40 records, and each hostname counts once per IP family, so 40 hostnames with `ip4` alone or 20 with both. Batches near that size need the paid Workers plan; the free plan's 50-subrequest ceiling fits roughly six records. `ip4`/`ip6` each accept a literal address or `auto`, which uses the connecting IP when it matches that family and skips the slot otherwise; provide at least one. Optional `zone=example.com` restricts matching to one zone. Optional `ntfy=` sends change notifications to your ntfy server, pasted raw: `ntfy=https://ntfy.sh/my-topic`. Do not percent-encode it; inadyn treats `%` sequences as its own substitution variables.)_
 
 ## 📜 **Audit History**
 
