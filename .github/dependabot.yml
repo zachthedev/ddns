@@ -22,6 +22,15 @@ updates:
         applies-to: version-updates
         patterns:
           - '*'
+    ignore:
+      # typescript-eslint declares a typescript peer range of >=4.8.4 <6.1.0.
+      # On a TS 7 tree the lint run does not warn and continue, it throws
+      # (`Cannot read properties of undefined (reading 'Cjs')`) and CI goes red.
+      # A 6.1 minor also leaves the range, and is left to fail loudly rather
+      # than pinning the whole minor line. Drop this once TS 7 is supported:
+      # https://typescript-eslint.io/users/dependency-versions
+      - dependency-name: 'typescript'
+        update-types: ['version-update:semver-major']
     open-pull-requests-limit: 10
     labels:
       - 'dependencies'
