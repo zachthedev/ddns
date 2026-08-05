@@ -21,6 +21,26 @@ export const createMockCloudflareClient = () => {
 	return mockClient;
 };
 
+/**
+ * Stands in for the SDK's `PagePromise`, which is both awaitable and async
+ * iterable. The worker consumes list endpoints with `for await`, so a mock
+ * that only resolves to the page would never yield an item.
+ *
+ * Pass the pages a real multi-page response would deliver in order.
+ */
+export const mockPage = <T>(...pages: { result: T[] }[]): Promise<{ result: T[] }> & AsyncIterable<T> => {
+	const first = pages[0] ?? { result: [] };
+	return Object.assign(Promise.resolve(first), {
+		async *[Symbol.asyncIterator](): AsyncGenerator<T> {
+			for (const page of pages) {
+				// The SDK fetches each page over the network, so the worker sees a
+				// suspension point at every page boundary. Keep that shape here.
+				yield* await Promise.resolve(page.result);
+			}
+		},
+	});
+};
+
 export const createMockKVNamespace = (): KVNamespace => {
 	const storage = new Map<string, string>();
 
@@ -93,6 +113,7 @@ export const createMockCtx = (): MockCtx => {
 		waitUntil,
 		passThroughOnException,
 		exports: {} as ExecutionContext['exports'],
+		tracing: {} as ExecutionContext['tracing'],
 		props: {},
 	};
 	return { ctx, waitUntil, passThroughOnException };
@@ -140,20 +161,24 @@ export const createBearerHeader = (rawToken: string): string => {
  */
 export const wireStandardHappyPath = (mockClient: ReturnType<typeof createMockCloudflareClient>): void => {
 	mockClient.user.tokens.verify.mockResolvedValue({ id: 'token-id-123', status: 'active' });
-	mockClient.zones.list.mockResolvedValue({
-		result: [{ id: 'zone123', name: 'example.com' }],
-	});
-	mockClient.dns.records.list.mockResolvedValue({
-		result: [
-			{
-				id: 'record123',
-				name: 'test.example.com',
-				type: 'A',
-				content: '192.168.1.1',
-				proxied: false,
-				ttl: 1,
-			},
-		],
-	});
+	mockClient.zones.list.mockReturnValue(
+		mockPage({
+			result: [{ id: 'zone123', name: 'example.com' }],
+		}),
+	);
+	mockClient.dns.records.list.mockReturnValue(
+		mockPage({
+			result: [
+				{
+					id: 'record123',
+					name: 'test.example.com',
+					type: 'A',
+					content: '192.168.1.1',
+					proxied: false,
+					ttl: 1,
+				},
+			],
+		}),
+	);
 	mockClient.dns.records.update.mockResolvedValue(undefined);
 };
