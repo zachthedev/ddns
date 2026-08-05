@@ -36,6 +36,12 @@ const RECORDS_MAX = 40;
 // permanent miss for that record.
 const HOSTNAME_MAX_LENGTH = 253;
 
+// Letters, digits and hyphens per label, with an optional wildcard leader.
+// Query parameters arrive percent-decoded, so without this a newline inside
+// a hostname reaches the log lines that quote it. IDNs belong here in their
+// punycode form, which is what the Cloudflare API expects anyway.
+const HOSTNAME_PATTERN = /^(\*\.)?[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*$/i;
+
 /**
  * Validates the caller-supplied ntfy URL. Any https endpoint is allowed
  * (self-hosted servers included): the notification body is worker-built
@@ -87,6 +93,12 @@ export class HttpError extends Error {
 	constructor(
 		public readonly statusCode: number,
 		message: string,
+		/**
+		 * Records that already reached DNS when a batch failed part-way. The
+		 * response carries them so a caller reading only the status never
+		 * concludes that nothing changed.
+		 */
+		public readonly applied: RecordResult[] = [],
 	) {
 		super(message);
 		this.name = new.target.name;
@@ -117,7 +129,17 @@ interface HistoryResponseBody {
 	};
 }
 
-function jsonResponse(body: UpdateResponseBody | HistoryResponseBody | { success: false; error: string }, status: number): Response {
+interface ErrorResponseBody {
+	success: false;
+	error: string;
+	/** Present only when a batch failed after some records already changed. */
+	data?: {
+		updated: boolean;
+		records: RecordResult[];
+	};
+}
+
+function jsonResponse(body: UpdateResponseBody | HistoryResponseBody | ErrorResponseBody, status: number): Response {
 	return new Response(JSON.stringify(body), {
 		status,
 		headers: { 'Content-Type': 'application/json' },
@@ -289,6 +311,10 @@ function constructDNSRecords(request: Request): UpdateRequest {
 	if (overlong !== undefined) {
 		throw new HttpError(422, `Hostname exceeds ${String(HOSTNAME_MAX_LENGTH)} characters: '${overlong.slice(0, 60)}...'`);
 	}
+	const malformed = hostnames.find((hostname) => !HOSTNAME_PATTERN.test(hostname));
+	if (malformed !== undefined) {
+		throw new HttpError(422, `Not a valid hostname: '${encodeURIComponent(malformed)}'`);
+	}
 
 	// Per hostname: an A record when ip4 resolved, an AAAA when ip6 did.
 	const records: DDNSRecord[] = [];
@@ -337,8 +363,10 @@ async function writeCachedIp(env: Env, tokenId: string, record: DDNSRecord): Pro
 }
 
 // A worker invocation is wall-clock bound, so the SDK defaults (60s per
-// request, 2 retries) would let one stalled call spend the whole budget.
-const API_TIMEOUT_MS = 10_000;
+// request, 2 retries) would let one stalled call spend the whole budget. A
+// batch waits for every record to settle before responding, so this ceiling
+// is also what bounds how long one slow record holds the whole response.
+const API_TIMEOUT_MS = 5_000;
 const API_MAX_RETRIES = 1;
 
 function apiClient(auth: ParsedAuth): Cloudflare {
@@ -446,10 +474,12 @@ function zonesHosting(zones: CachedZone[], hostname: string): CachedZone[] {
 
 /**
  * Looks up, compares, and (when the DNS content differs) updates one record.
- * Zone lookups run in parallel. Throws HttpError on no/ambiguous matches;
- * with records processed concurrently, sibling records may already have
- * updated when one throws (same partial-application semantics as the old
- * sequential loop, which aborted mid-way).
+ * Zone lookups run in parallel. Throws HttpError on no or ambiguous matches.
+ *
+ * A batch applies partially: records are processed concurrently, so a throw
+ * here leaves siblings already updated. The caller audits and notifies for
+ * those before surfacing the failure, so a refused request never hides a
+ * change that reached DNS.
  */
 async function processRecord(
 	cloudflare: Cloudflare,
@@ -607,14 +637,14 @@ async function updateHostnames(
 
 	const callerIp = request.headers.get('CF-Connecting-IP');
 	const visibleZones = zones;
-	const processed = await Promise.all(
+	// Settled, not all: records are processed concurrently, so one failure
+	// leaves siblings that already changed DNS. Those changes are real and
+	// have to reach the audit trail and the notification whether or not the
+	// request as a whole ends up refused.
+	const settled = await Promise.allSettled(
 		pending.map(async (record) => processRecord(cloudflare, env, visibleZones, record, callerIp, tokenId)),
 	);
-	const processedByRecord = new Map(processed.map((p) => [p.record, p]));
-
-	const results: RecordResult[] = records.map(
-		(record) => processedByRecord.get(record)?.result ?? { hostname: record.name, type: record.type, ip: record.content, updated: false },
-	);
+	const processed = settled.filter((outcome) => outcome.status === 'fulfilled').map((outcome) => outcome.value);
 	const updateMessages = processed.map((p) => p.message).filter((m): m is string => m !== null);
 
 	// Audit writes and the change notification ride after the response;
@@ -627,6 +657,29 @@ async function updateHostnames(
 	);
 	if (updateMessages.length > 0) {
 		ctx.waitUntil(pushNtfy(updateMessages, ntfyUrl));
+	}
+
+	const processedByRecord = new Map(processed.map((p) => [p.record, p]));
+	const results: RecordResult[] = records.map(
+		(record) => processedByRecord.get(record)?.result ?? { hostname: record.name, type: record.type, ip: record.content, updated: false },
+	);
+
+	// Only once what landed is recorded and reportable does a failure decide
+	// the response.
+	const rejected = settled.filter((outcome) => outcome.status === 'rejected').map((outcome) => outcome.reason as unknown);
+	for (const reason of rejected) {
+		console.error('Record update failed:', reason);
+	}
+	if (rejected.length > 0) {
+		// An HttpError names what the caller must fix. Taking the first by
+		// index instead would let a transient 500 on an early record mask it,
+		// and 5xx is the status a DDNS client retries against.
+		const actionable = rejected.find((reason) => reason instanceof HttpError);
+		const applied = results.filter((result) => result.updated);
+		if (actionable !== undefined) {
+			throw new HttpError(actionable.statusCode, actionable.message, applied);
+		}
+		throw new HttpError(500, 'Internal Server Error', applied);
 	}
 
 	const anyUpdated = updateMessages.length > 0;
@@ -696,7 +749,13 @@ export default {
 			const isHttpError = err instanceof HttpError;
 			const message = isHttpError ? err.message : 'Internal Server Error';
 			const statusCode = isHttpError ? err.statusCode : 500;
+			const applied = isHttpError ? err.applied : [];
 			console.error(`Error handling request: ${message}`, err);
+			// A partly-applied batch reports what changed, so the caller does
+			// not read the error as "nothing happened".
+			if (applied.length > 0) {
+				return jsonResponse({ success: false, error: message, data: { updated: true, records: applied } }, statusCode);
+			}
 			return jsonResponse({ success: false, error: message }, statusCode);
 		}
 	},
