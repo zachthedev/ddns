@@ -1,6 +1,16 @@
-import { AuthenticationError, BadRequestError, Cloudflare, PermissionDeniedError } from 'cloudflare';
+import {
+	APIError,
+	AuthenticationError,
+	BadRequestError,
+	Cloudflare,
+	NotFoundError,
+	PermissionDeniedError,
+	RateLimitError,
+} from 'cloudflare';
 import { HISTORY_DEFAULT_LIMIT, queryHistory, writeAuditEvents, type AuditEvent } from './audit';
 import { pushNtfy } from './pushNtfy';
+import type { RefusalTally } from './refusals';
+export { RefusalCounter } from './refusals';
 
 /**
  * A DNS record this worker manages. Narrower than the SDK's record types:
@@ -41,6 +51,20 @@ const HOSTNAME_MAX_LENGTH = 253;
 // a hostname reaches the log lines that quote it. IDNs belong here in their
 // punycode form, which is what the Cloudflare API expects anyway.
 const HOSTNAME_PATTERN = /^(\*\.)?[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*$/i;
+
+/**
+ * A rejected value, shortened for the message that quotes it back.
+ *
+ * `encodeURIComponent` throws on a lone surrogate, which would answer a rejected
+ * input with the 500 a DDNS client retries against. Two things can produce one:
+ * a cut that lands mid-pair, which the `u` flag prevents by cutting on code
+ * points, and a value that already carried one, which `toWellFormed` replaces.
+ * Encoding comes last so the result is always decodable, and it removes the
+ * newline that would otherwise forge a line in the log.
+ */
+function quoteInput(value: string): string {
+	return encodeURIComponent(value.toWellFormed().replace(/^([\s\S]{0,60})[\s\S]*$/u, '$1'));
+}
 
 /**
  * Validates the caller-supplied ntfy URL. Any https endpoint is allowed
@@ -89,18 +113,81 @@ function cacheKey(tokenId: string, record: DDNSRecord): string {
 	return `${KV_KEY_PREFIX}:${tokenId}:${record.name}:${record.type}`;
 }
 
+/** Today in UTC, the bucket the refusal counter is kept and reported at. */
+function currentDay(): string {
+	return new Date().toISOString().slice(0, 10);
+}
+
+// Names quoted in the alert, enough to act on without dumping the whole list.
+// Taken from the end, because the list is in the order the caller supplied it
+// and the head is whatever it opened the day with. The tail at least describes
+// what it is doing now.
+const ALERT_SAMPLE = -5;
+
+/**
+ * Adds to the caller's refusal tally. Best-effort: the counter is a signal, so
+ * losing one must never fail an update that already happened.
+ *
+ * The counter decides when a tally is worth reporting, and this logs it, because
+ * the tally is otherwise readable only through `/history`, which is scoped to
+ * the very token being counted. A caller probing hostnames it does not own has
+ * no reason to read its own history, so without this the count would only ever
+ * be seen by the one party it describes. A sample of the names rides along: the
+ * operator who reads the log cannot query the tally it refers to.
+ */
+async function countRefusals(env: Env, tokenId: string, hostnames: string[]): Promise<void> {
+	try {
+		const tally = await env.REFUSALS.getByName(tokenId).add(currentDay(), hostnames);
+		if (tally.alert) {
+			const sample = tally.hostnames.slice(ALERT_SAMPLE).join(', ');
+			console.warn(
+				`Token ${tokenId} reached past its authority for ${String(tally.distinct)} distinct hostnames today, including: ${sample}`,
+			);
+		}
+	} catch (error) {
+		console.error(`Failed to count refusals for token ${tokenId}:`, error);
+	}
+}
+
+/** The caller's refusals for today; an unreadable counter reads as none. */
+async function readRefusalTally(env: Env, tokenId: string): Promise<RefusalTally> {
+	try {
+		return await env.REFUSALS.getByName(tokenId).tally(currentDay());
+	} catch (error) {
+		console.error(`Failed to read the refusal tally for token ${tokenId}:`, error);
+		return { total: 0, distinct: 0, hostnames: [] };
+	}
+}
+
 export class HttpError extends Error {
 	constructor(
 		public readonly statusCode: number,
 		message: string,
 		/**
-		 * Records that already reached DNS when a batch failed part-way. The
-		 * response carries them so a caller reading only the status never
-		 * concludes that nothing changed.
+		 * What the batch did before it failed, when the failure came from one.
+		 * The response carries it so a caller reading only the status never
+		 * concludes that nothing changed, and never takes one record's verdict
+		 * for the rest of the batch.
 		 */
-		public readonly applied: RecordResult[] = [],
+		public readonly batch: BatchOutcome | null = null,
 	) {
 		super(message);
+		this.name = new.target.name;
+		Object.setPrototypeOf(this, new.target.prototype);
+	}
+}
+
+/**
+ * A hostname no zone on the token could hold.
+ *
+ * Its own class because it is the one refusal that says something about the
+ * caller rather than about its configuration. A record that has not been
+ * created yet, or a token missing a scope, is a setup step every new user goes
+ * through; asking after a name outside the token's zones is not.
+ */
+export class OutsideAuthority extends HttpError {
+	constructor(hostname: string) {
+		super(400, `No matching record found for '${hostname}'. Create it manually first.`);
 		this.name = new.target.name;
 		Object.setPrototypeOf(this, new.target.prototype);
 	}
@@ -109,8 +196,102 @@ export class HttpError extends Error {
 interface RecordResult {
 	hostname: string;
 	type: string;
+	/**
+	 * The address this request asked for. On a record that failed it is what
+	 * was requested rather than what DNS holds, so `failed` below is the only
+	 * place to learn which of the two a `false` in `updated` means.
+	 */
 	ip: string;
 	updated: boolean;
+}
+
+/**
+ * One record that did not make it, with its own status.
+ *
+ * A batch fails per record, and the response can only carry one status. Without
+ * this list a terminal 400 on a misspelled hostname speaks for a transient 500
+ * on the record beside it, and the client stops retrying the one it should keep
+ * retrying.
+ */
+interface RecordFailure {
+	hostname: string;
+	type: string;
+	status: number;
+	error: string;
+}
+
+/** What a batch did before it failed. */
+interface BatchOutcome {
+	/**
+	 * Every record in the request, with what happened to it. The full list, not
+	 * just the ones that changed: a record that was already current and one
+	 * that failed both carry `updated: false`, so a list of changes alone
+	 * cannot tell them apart.
+	 */
+	records: RecordResult[];
+	failed: RecordFailure[];
+}
+
+/**
+ * One rejection as the caller should see it: a status saying whether to retry,
+ * and a message saying what to fix. SDK errors are translated rather than
+ * forwarded, so nothing from the upstream response reaches the caller.
+ */
+function describeFailure(reason: unknown): { status: number; message: string } {
+	if (reason instanceof AuthenticationError) {
+		return { status: 401, message: 'Authentication failed: invalid token.' };
+	}
+	if (reason instanceof HttpError) {
+		return { status: reason.statusCode, message: reason.message };
+	}
+	if (reason instanceof PermissionDeniedError) {
+		return { status: 403, message: 'The API token lacks permission for this record.' };
+	}
+	if (reason instanceof RateLimitError) {
+		return { status: 429, message: 'The Cloudflare API is rate limiting this token. Retry later.' };
+	}
+	// Both are terminal: the record as asked for cannot be written, and no
+	// amount of retrying changes that. Left to the 500 below, a DDNS client
+	// would spend a lookup and an update call on every poll forever.
+	if (reason instanceof BadRequestError) {
+		return { status: 400, message: 'Cloudflare rejected this record. Check that the name exists and its type matches the address family.' };
+	}
+	if (reason instanceof NotFoundError) {
+		return { status: 404, message: 'Cloudflare no longer has this zone or record.' };
+	}
+	// Every other terminal answer the API can give, 409 and 422 among them.
+	// Left to the 500 below they would read as a server fault, and a client
+	// retries a server fault forever. The status is read through a shape rather
+	// than off the class, whose generic parameters narrow to `any`, and an
+	// absent one becomes NaN and falls through.
+	const status = reason instanceof APIError ? Number((reason as { status: unknown }).status) : Number.NaN;
+	if (status >= 400 && status < 500) {
+		return { status, message: 'Cloudflare rejected this record.' };
+	}
+	return { status: 500, message: 'Internal Server Error' };
+}
+
+/**
+ * Which failure speaks for a mixed batch, lowest first.
+ *
+ * A dead credential outranks every record-level answer, because none of them
+ * can be acted on with a token that no longer works. A 400 comes next as the
+ * one that names the caller's own request precisely. Terminal outranks
+ * transient throughout, because 429 and 5xx are what a DDNS client retries
+ * against, and a caller told only to retry later never fixes the record that
+ * cannot work at all.
+ */
+function failureRank({ status }: { status: number }): number {
+	if (status === 401) {
+		return 0;
+	}
+	if (status === 400) {
+		return 1;
+	}
+	if (status === 429) {
+		return 3;
+	}
+	return status < 500 ? 2 : 4;
 }
 
 interface UpdateResponseBody {
@@ -126,23 +307,34 @@ interface HistoryResponseBody {
 	success: boolean;
 	data: {
 		events: Record<string, unknown>[];
+		/** Refusals counted against this token today, UTC. */
+		refusedToday: RefusalTally;
 	};
 }
 
 interface ErrorResponseBody {
 	success: false;
 	error: string;
-	/** Present only when a batch failed after some records already changed. */
+	/** Present only when the failure came from a batch of records. */
 	data?: {
 		updated: boolean;
 		records: RecordResult[];
+		failed: RecordFailure[];
 	};
 }
 
 function jsonResponse(body: UpdateResponseBody | HistoryResponseBody | ErrorResponseBody, status: number): Response {
 	return new Response(JSON.stringify(body), {
 		status,
-		headers: { 'Content-Type': 'application/json' },
+		// Caller-supplied values are reflected into error bodies, so pin the
+		// type rather than leave a sniffing browser to pick one. `no-store`
+		// because /history carries audit rows, caller IPs, and the refused
+		// hostnames, which a private cache would otherwise keep on disk.
+		headers: {
+			'Content-Type': 'application/json',
+			'X-Content-Type-Options': 'nosniff',
+			'Cache-Control': 'no-store',
+		},
 	});
 }
 
@@ -233,6 +425,61 @@ interface ResolvedIps {
 	v6: string | null;
 }
 
+// Dotted quad, each octet 0-255. A substring check would let any text through
+// as long as it held a dot, and that text reaches the Cloudflare API and the
+// response body.
+const IPV4_PATTERN = /^((25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\.){3}(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)$/;
+
+// Everything an IPv6 literal may contain. Checked before the value is placed
+// inside brackets below, so it cannot carry `]`, `/` or `@` and escape them.
+//
+// The dot is excluded, which rules out every dotted tail. The parser rewrites
+// one to hex, and whether RFC 5952 renders it back dotted depends on the range:
+// mapped and IPv4-compatible addresses yes, an embedded quad anywhere else no.
+// Telling those apart means knowing how Cloudflare renders each one, so all
+// dotted spellings are refused and the hex form of the same address, which is
+// what the parser would have stored anyway, is accepted.
+const IPV6_CHARSET = /^[0-9a-f:]+$/i;
+
+// The IPv4-mapped range, `::ffff:0:0/96`, in the hex spelling the parser emits.
+// Excluding the dot above only refuses the dotted way of writing it; every
+// RFC 5952 implementation renders this range back as dotted whichever way it
+// arrived, so the hex spelling flaps in exactly the same way. Neither is a
+// useful AAAA target.
+const IPV6_MAPPED_PREFIX = '::ffff:';
+
+/**
+ * The canonical form of the address, or null when it is not one of that family.
+ *
+ * IPv6 is delegated to the URL parser rather than matched by hand. Its grammar
+ * is the platform's own, and a group-splitting check quietly accepts stray
+ * colons (`:::`, `1::2:`, `:1:2:3:4:5:6:7:8`) that it rejects.
+ *
+ * The canonical spelling is what gets stored. Cloudflare canonicalises too, so
+ * forwarding `2001:0DB8::1` verbatim would leave the comparison against the
+ * stored record permanently unequal: every poll would issue a real update,
+ * write an audit row, and fire a notification for a change that never happened.
+ */
+function canonicalIp(value: string, family: 'v4' | 'v6'): string | null {
+	if (family === 'v4') {
+		// The pattern already rejects leading zeros, so a match is canonical.
+		return IPV4_PATTERN.test(value) ? value : null;
+	}
+	if (value.length > 45 || !value.includes(':') || !IPV6_CHARSET.test(value)) {
+		return null;
+	}
+	try {
+		// A bracketed host only parses when it is a valid IPv6 literal, and a
+		// parse that succeeds always yields the bracketed compressed lower-case
+		// form, so the brackets come straight back off.
+		const { hostname } = new URL(`http://[${value}]/`);
+		const canonical = hostname.slice(1, -1);
+		return canonical.startsWith(IPV6_MAPPED_PREFIX) ? null : canonical;
+	} catch {
+		return null;
+	}
+}
+
 /**
  * Resolves the requested IPs from the ip4/ip6 parameters.
  *
@@ -244,35 +491,37 @@ interface ResolvedIps {
 function resolveIps(searchParams: URLSearchParams, request: Request): ResolvedIps {
 	const raw4 = searchParams.get('ip4')?.trim() ?? null;
 	const raw6 = searchParams.get('ip6')?.trim() ?? null;
-	const connectingIp = request.headers.get('CF-Connecting-IP');
+	// Absent outside Cloudflare's edge; an empty value fails address
+	// validation like any other non-address, so `auto` simply skips its slot.
+	const connectingIp = request.headers.get('CF-Connecting-IP') ?? '';
 
 	let v4: string | null = null;
 	if (raw4 !== null && raw4 !== '') {
 		if (raw4 === 'auto') {
-			if (connectingIp?.includes('.')) {
-				v4 = connectingIp;
-			} else {
+			v4 = canonicalIp(connectingIp, 'v4');
+			if (v4 === null) {
 				console.log('ip4=auto requested but the client did not connect over IPv4; skipping A records.');
 			}
-		} else if (!raw4.includes('.')) {
-			throw new HttpError(422, "The 'ip4' parameter must be a valid IPv4 address.");
 		} else {
-			v4 = raw4;
+			v4 = canonicalIp(raw4, 'v4');
+			if (v4 === null) {
+				throw new HttpError(422, "The 'ip4' parameter must be a valid IPv4 address.");
+			}
 		}
 	}
 
 	let v6: string | null = null;
 	if (raw6 !== null && raw6 !== '') {
 		if (raw6 === 'auto') {
-			if (connectingIp?.includes(':')) {
-				v6 = connectingIp;
-			} else {
+			v6 = canonicalIp(connectingIp, 'v6');
+			if (v6 === null) {
 				console.log('ip6=auto requested but the client did not connect over IPv6; skipping AAAA records.');
 			}
-		} else if (!raw6.includes(':')) {
-			throw new HttpError(422, "The 'ip6' parameter must be a valid IPv6 address.");
 		} else {
-			v6 = raw6;
+			v6 = canonicalIp(raw6, 'v6');
+			if (v6 === null) {
+				throw new HttpError(422, "The 'ip6' parameter must be a valid IPv6 address.");
+			}
 		}
 	}
 
@@ -309,11 +558,17 @@ function constructDNSRecords(request: Request): UpdateRequest {
 	}
 	const overlong = hostnames.find((hostname) => hostname.length > HOSTNAME_MAX_LENGTH);
 	if (overlong !== undefined) {
-		throw new HttpError(422, `Hostname exceeds ${String(HOSTNAME_MAX_LENGTH)} characters: '${overlong.slice(0, 60)}...'`);
+		throw new HttpError(422, `Hostname exceeds ${String(HOSTNAME_MAX_LENGTH)} characters: '${quoteInput(overlong)}...'`);
 	}
 	const malformed = hostnames.find((hostname) => !HOSTNAME_PATTERN.test(hostname));
 	if (malformed !== undefined) {
-		throw new HttpError(422, `Not a valid hostname: '${encodeURIComponent(malformed)}'`);
+		throw new HttpError(422, `Not a valid hostname: '${quoteInput(malformed)}'`);
+	}
+	// Held to the same shape as a hostname, and for the same reason: the value
+	// reaches log lines, the refusal tally, and the `/history` response that
+	// echoes the tally back.
+	if (zoneFilter !== null && zoneFilter !== '' && (zoneFilter.length > HOSTNAME_MAX_LENGTH || !HOSTNAME_PATTERN.test(zoneFilter))) {
+		throw new HttpError(422, `Not a valid zone name: '${quoteInput(zoneFilter)}'`);
 	}
 
 	// Per hostname: an A record when ip4 resolved, an AAAA when ip6 did.
@@ -401,6 +656,15 @@ async function verifyToken(cloudflare: Cloudflare): Promise<string> {
 // on every consecutive update. Stale entries self-heal via TTL.
 const ZONES_TTL_SECONDS = 5 * 60;
 
+// An empty result gets its own, shorter life. A token that can see no zones
+// belongs to an account still being set up, and its first zone lands minutes
+// later, so the full TTL would keep answering "no zones" after the zone exists.
+// Not caching it at all is worse: every request from a zone-less token would
+// walk the API instead of reading one KV key, with nothing bounding the rate.
+// KV refuses anything under 60 seconds, and the refusal reaches the catch in
+// writeCachedZones, so a lower value here is a cache that silently never exists.
+const ZONES_EMPTY_TTL_SECONDS = 60;
+
 // The zones endpoint caps per_page at 50; asking for the cap keeps the page
 // walk short for tokens scoped to many zones. The ceiling bounds the walk at
 // a caller-supplied token's zone count, which the worker does not control.
@@ -439,7 +703,9 @@ async function readCachedZones(env: Env, tokenId: string): Promise<CachedZone[] 
 
 async function writeCachedZones(env: Env, tokenId: string, zones: CachedZone[]): Promise<void> {
 	try {
-		await env.DDNS_KV.put(zonesCacheKey(tokenId), JSON.stringify(zones), { expirationTtl: ZONES_TTL_SECONDS });
+		await env.DDNS_KV.put(zonesCacheKey(tokenId), JSON.stringify(zones), {
+			expirationTtl: zones.length > 0 ? ZONES_TTL_SECONDS : ZONES_EMPTY_TTL_SECONDS,
+		});
 	} catch (error) {
 		console.error(`Failed to write zones cache for token ${tokenId}:`, error);
 	}
@@ -473,6 +739,21 @@ function zonesHosting(zones: CachedZone[], hostname: string): CachedZone[] {
 }
 
 /**
+ * The two zone lists a record is judged against.
+ *
+ * They differ only when the caller sets `zone=`, and keeping them apart is what
+ * stops the caller's own narrowing from reading as a reach past authority: a
+ * hostname in another zone the token holds is excluded by the filter, not by
+ * the token's permissions.
+ */
+interface ZoneScope {
+	/** Every zone the token holds. Authority is decided against this. */
+	authority: CachedZone[];
+	/** The zones actually searched for the record. */
+	searched: CachedZone[];
+}
+
+/**
  * Looks up, compares, and (when the DNS content differs) updates one record.
  * Zone lookups run in parallel. Throws HttpError on no or ambiguous matches.
  *
@@ -484,12 +765,24 @@ function zonesHosting(zones: CachedZone[], hostname: string): CachedZone[] {
 async function processRecord(
 	cloudflare: Cloudflare,
 	env: Env,
-	zones: CachedZone[],
+	scope: ZoneScope,
 	record: DDNSRecord,
 	callerIp: string | null,
 	tokenId: string,
 ): Promise<ProcessedRecord> {
-	const candidates = zonesHosting(zones, record.name);
+	if (zonesHosting(scope.authority, record.name).length === 0) {
+		// Distinct from "the record does not exist yet", which is what a user
+		// setting the worker up hits on every poll until they create it. No
+		// zone on the token can hold this name at all, so the caller is asking
+		// about something outside its authority. Only that is worth counting.
+		throw new OutsideAuthority(record.name);
+	}
+	const candidates = zonesHosting(scope.searched, record.name);
+	if (candidates.length === 0) {
+		// The token holds a zone that could serve this name, and the caller's
+		// own `zone=` excluded it. Neither a missing record nor a reach.
+		throw new HttpError(400, `'${record.name}' is outside the zone requested with 'zone='.`);
+	}
 	const lists = await Promise.all(
 		candidates.map(async (zone) => {
 			// Awaited, not iterated: the SDK's page iterator stops only after
@@ -611,40 +904,101 @@ async function updateHostnames(
 		// zone 21+ would otherwise report as having no matching record. The
 		// result is cached per token, so the page walk is rare.
 		const discovered: CachedZone[] = [];
-		for await (const zone of cloudflare.zones.list({ per_page: ZONE_PAGE_SIZE })) {
-			discovered.push({ id: zone.id, name: zone.name });
-			if (discovered.length >= ZONE_LIST_MAX) {
-				console.warn(`Token ${tokenId} sees more than ${String(ZONE_LIST_MAX)} zones; searching only the first ${String(ZONE_LIST_MAX)}.`);
-				break;
+		try {
+			for await (const zone of cloudflare.zones.list({ per_page: ZONE_PAGE_SIZE })) {
+				discovered.push({ id: zone.id, name: zone.name });
+				if (discovered.length >= ZONE_LIST_MAX) {
+					console.warn(
+						`Token ${tokenId} sees more than ${String(ZONE_LIST_MAX)} zones; searching only the first ${String(ZONE_LIST_MAX)}.`,
+					);
+					break;
+				}
 			}
+		} catch (reason: unknown) {
+			// Categorised by the same function the record path uses, so a new
+			// error class lands in one place. Left uncategorised these become a
+			// 500, which is the one status a DDNS client retries against forever.
+			const { status, message } = describeFailure(reason);
+			if (status >= 500) {
+				throw reason;
+			}
+			throw new HttpError(
+				status,
+				// A token with DNS edit but no Zone Read is the documented setup
+				// mistake, and it fails here rather than on a record lookup. The
+				// generic per-record wording would send the user hunting through
+				// their records for it.
+				status === 403 ? 'The API token cannot list zones. It needs Zone > Zone > Read as well as Zone > DNS > Edit.' : message,
+			);
 		}
 		zones = discovered;
+		// Cached either way, an empty result under its own short TTL.
 		ctx.waitUntil(writeCachedZones(env, tokenId, discovered));
+	}
+
+	// A refusal never drops the cached list. A zone added to the token since
+	// the list was cached does read like a reach past authority, but clearing
+	// on that reading costs a full zone walk on every poll for as long as one
+	// hostname stays misspelled, and a misspelling outlives any zone change.
+	// The TTL already bounds the staleness at ZONES_TTL_SECONDS.
+	const authority = zones;
+
+	/**
+	 * Counts one reach past the token's authority, unless the zone list is capped.
+	 *
+	 * A list sitting at ZONE_LIST_MAX may be missing zones beyond it, and a name
+	 * in one of those was never looked for rather than reached for. Counting it
+	 * would put the largest legitimate accounts in the tally, which is precisely
+	 * the population the alert exists to exclude.
+	 */
+	const refuse = (hostnames: string[]): void => {
+		if (authority.length < ZONE_LIST_MAX) {
+			ctx.waitUntil(countRefusals(env, tokenId, hostnames));
+		}
+	};
+
+	if (zones.length === 0) {
+		// Uncounted, unlike the zone filter below: seeing no zones at all says
+		// the account has none yet or the token was scoped to none, both setup
+		// states every new user passes through. Counting them would bury the
+		// signal under first afternoons.
+		throw new HttpError(400, 'No zones available with current permissions.');
 	}
 	if (zoneFilter !== null) {
 		// Lowercased on both sides, matching zonesHosting: DNS names are
 		// case-insensitive, and a case mismatch here would read as a token
 		// permissions problem.
 		const wanted = zoneFilter.toLowerCase();
-		zones = zones.filter((zone) => zone.name.toLowerCase() === wanted);
-		if (zones.length === 0) {
+		const scoped = zones.filter((zone) => zone.name.toLowerCase() === wanted);
+		if (scoped.length === 0) {
+			// One reach, not one per record: naming a zone the token cannot see
+			// is a single assertion about authority however large the batch.
+			refuse([wanted]);
 			throw new HttpError(400, `Zone '${zoneFilter}' not available with current permissions.`);
 		}
-	}
-	if (zones.length === 0) {
-		throw new HttpError(400, 'No zones available with current permissions.');
+		zones = scoped;
 	}
 
 	const callerIp = request.headers.get('CF-Connecting-IP');
-	const visibleZones = zones;
-	// Settled, not all: records are processed concurrently, so one failure
-	// leaves siblings that already changed DNS. Those changes are real and
-	// have to reach the audit trail and the notification whether or not the
-	// request as a whole ends up refused.
-	const settled = await Promise.allSettled(
-		pending.map(async (record) => processRecord(cloudflare, env, visibleZones, record, callerIp, tokenId)),
+	const scope: ZoneScope = { authority, searched: zones };
+	// Each outcome carries the record it belongs to, and none of them reject:
+	// records are processed concurrently, so one failure leaves siblings that
+	// already changed DNS. Those changes are real and have to reach the audit
+	// trail and the notification whether or not the request ends up refused,
+	// and each failure has to be reportable against its own hostname.
+	const settled = await Promise.all(
+		pending.map(async (record) =>
+			processRecord(cloudflare, env, scope, record, callerIp, tokenId).then(
+				(value): { record: DDNSRecord; processed: ProcessedRecord | null; reason: unknown } => ({
+					record,
+					processed: value,
+					reason: null,
+				}),
+				(reason: unknown) => ({ record, processed: null, reason }),
+			),
+		),
 	);
-	const processed = settled.filter((outcome) => outcome.status === 'fulfilled').map((outcome) => outcome.value);
+	const processed = settled.map((outcome) => outcome.processed).filter((p): p is ProcessedRecord => p !== null);
 	const updateMessages = processed.map((p) => p.message).filter((m): m is string => m !== null);
 
 	// Audit writes and the change notification ride after the response;
@@ -666,20 +1020,41 @@ async function updateHostnames(
 
 	// Only once what landed is recorded and reportable does a failure decide
 	// the response.
-	const rejected = settled.filter((outcome) => outcome.status === 'rejected').map((outcome) => outcome.reason as unknown);
-	for (const reason of rejected) {
+	const failed = settled.filter((outcome) => outcome.processed === null);
+	for (const { reason } of failed) {
 		console.error('Record update failed:', reason);
 	}
-	if (rejected.length > 0) {
-		// An HttpError names what the caller must fix. Taking the first by
-		// index instead would let a transient 500 on an early record mask it,
-		// and 5xx is the status a DDNS client retries against.
-		const actionable = rejected.find((reason) => reason instanceof HttpError);
-		const applied = results.filter((result) => result.updated);
-		if (actionable !== undefined) {
-			throw new HttpError(actionable.statusCode, actionable.message, applied);
-		}
-		throw new HttpError(500, 'Internal Server Error', applied);
+
+	// Only a reach past authority counts. A 403 from the record call cannot be
+	// one: the zone was already confirmed to be on the token, so it means a
+	// missing DNS scope, which is a setup mistake like any other.
+	// AuthenticationError is excluded: a token revoked mid-request is a
+	// credential lifecycle event, not the caller overreaching.
+	// Deduplicated: one hostname with both ip4 and ip6 is two records and two
+	// failures, and counting it twice would make a dual-stack caller look twice
+	// as persistent as a single-stack one asking the same question.
+	const refused = [
+		...new Set(failed.filter(({ reason }) => reason instanceof OutsideAuthority).map(({ record }) => record.name.toLowerCase())),
+	];
+	if (refused.length > 0) {
+		refuse(refused);
+	}
+
+	if (failed.length > 0) {
+		const described = failed.map(({ record, reason }) => ({ record, ...describeFailure(reason) }));
+		const batch: BatchOutcome = {
+			records: results,
+			// Every failure, each against its own hostname. The single status
+			// below can only describe one of them, and a client that reads only
+			// the status would stop retrying a record that deserves a retry.
+			failed: described.map(({ record, status, message }) => ({ hostname: record.name, type: record.type, status, error: message })),
+		};
+		// One status has to speak for the batch, and it is the most actionable
+		// one rather than the first by index. Ranked rather than matched against
+		// a list of known statuses, so a status describeFailure learns to emit
+		// cannot silently degrade to the 500 the list would not have covered.
+		const chosen = described.reduce((best, candidate) => (failureRank(candidate) < failureRank(best) ? candidate : best));
+		throw new HttpError(chosen.status, chosen.message, batch);
 	}
 
 	const anyUpdated = updateMessages.length > 0;
@@ -706,8 +1081,8 @@ async function handleHistory(auth: ParsedAuth, request: Request, env: Env): Prom
 	const limitParam = Number(searchParams.get('limit') ?? HISTORY_DEFAULT_LIMIT);
 	const limit = Number.isFinite(limitParam) ? limitParam : HISTORY_DEFAULT_LIMIT;
 
-	const events = await queryHistory(env, { tokenId, hostname, limit });
-	return jsonResponse({ success: true, data: { events } }, 200);
+	const [events, refusedToday] = await Promise.all([queryHistory(env, { tokenId, hostname, limit }), readRefusalTally(env, tokenId)]);
+	return jsonResponse({ success: true, data: { events, refusedToday } }, 200);
 }
 
 export default {
@@ -749,12 +1124,20 @@ export default {
 			const isHttpError = err instanceof HttpError;
 			const message = isHttpError ? err.message : 'Internal Server Error';
 			const statusCode = isHttpError ? err.statusCode : 500;
-			const applied = isHttpError ? err.applied : [];
+			const batch = isHttpError ? err.batch : null;
 			console.error(`Error handling request: ${message}`, err);
-			// A partly-applied batch reports what changed, so the caller does
-			// not read the error as "nothing happened".
-			if (applied.length > 0) {
-				return jsonResponse({ success: false, error: message, data: { updated: true, records: applied } }, statusCode);
+			// A failed batch reports what changed and what did not, so the
+			// caller neither reads the error as "nothing happened" nor takes
+			// one record's status for the whole request.
+			if (batch !== null) {
+				return jsonResponse(
+					{
+						success: false,
+						error: message,
+						data: { updated: batch.records.some((result) => result.updated), records: batch.records, failed: batch.failed },
+					},
+					statusCode,
+				);
 			}
 			return jsonResponse({ success: false, error: message }, statusCode);
 		}

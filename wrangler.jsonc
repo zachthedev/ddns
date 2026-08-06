@@ -50,6 +50,25 @@
 		},
 	],
 
+	// One instance per API token. Requests to an instance serialize, which is
+	// what makes the refusal tally immune to the races and burst timing that a
+	// KV counter could not defend against.
+	"durable_objects": {
+		"bindings": [
+			{
+				"name": "REFUSALS",
+				"class_name": "RefusalCounter",
+			},
+		],
+	},
+
+	"exports": {
+		"RefusalCounter": {
+			"type": "durable-object",
+			"storage": "sqlite",
+		},
+	},
+
 	// Workers Logs
 	// Docs: https://developers.cloudflare.com/workers/observability/logs/workers-logs/
 	"observability": {
