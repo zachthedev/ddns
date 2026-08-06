@@ -3,10 +3,13 @@ name: Deploy
 permissions:
   contents: read
 
+# Releases deploy, pushes do not. The deploy applies D1 migrations, so tying
+# it to a tag is what makes the schema in production correspond to a revision
+# anyone can check out, rather than to whichever commit last reached main.
 on:
   push:
-    branches:
-      - main
+    tags:
+      - 'v*.*.*'
   workflow_dispatch:
 
 jobs:
@@ -23,6 +26,11 @@ jobs:
 
       - name: Install dependencies
         run: bun install --frozen-lockfile
+
+      # A tag has no pull request behind it, so nothing else would have run
+      # these against the exact revision about to reach production.
+      - name: Verify
+        run: bun run check:all
 
       # scripts/deploy.ts is the single deploy path: it generates
       # wrangler.deploy.jsonc with the resource IDs, applies D1 migrations,

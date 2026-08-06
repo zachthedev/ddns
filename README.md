@@ -58,10 +58,10 @@ Requires [bun](https://bun.sh).
    ```
 5. Note the `*.workers.dev` route.
 
-#### **Option 3: Deploy on every push with GitHub Actions**
+#### **Option 3: Deploy on every release with GitHub Actions**
 
 Fork this repository, run setup locally once (Option 2, steps 1 to 3), then add
-these repository secrets; every push to `main` deploys automatically:
+these repository secrets:
 
 - `CLOUDFLARE_API_TOKEN` - API token with Workers Scripts, Workers KV, and D1 edit permissions
 - `CLOUDFLARE_ACCOUNT_ID` - Your Cloudflare account ID
@@ -69,6 +69,18 @@ these repository secrets; every push to `main` deploys automatically:
 - `KV_NAMESPACE_PREVIEW_ID` - Preview namespace ID (from `.env.local`)
 - `D1_DATABASE_ID` - Audit database ID (from `.env.local`)
 - `ACCESS_KEY` - Optional; locks the worker to callers that present it
+
+Pushing a `v*.*.*` tag then verifies and deploys that revision:
+
+```sh
+git tag v1.0.1
+git push origin v1.0.1
+```
+
+Tags rather than every push to `main`, because the deploy applies the D1
+migrations. Tying it to a tag means the schema in production corresponds to a
+revision you can check out, instead of to whichever commit landed last. Use the
+workflow's manual run to deploy without cutting a tag.
 
 Notifications need no deployment configuration: callers pass their own ntfy
 target with the `ntfy=` query parameter.
