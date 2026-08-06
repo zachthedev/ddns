@@ -15,43 +15,77 @@ import { Cloudflare } from 'cloudflare';
 // vi.mock factories are hoisted above import declarations, so any class or
 // variable the factory references must be created inside vi.hoisted() so it
 // is also hoisted and available when the factory runs.
-const { MockAPIError, MockBadRequestError, MockAuthenticationError, MockPermissionDeniedError, MockInternalServerError } = vi.hoisted(
-	() => {
-		class MockAPIError extends Error {
-			status: number;
-			constructor(status: number, message = 'API error') {
-				super(message);
-				this.name = 'APIError';
-				this.status = status;
-			}
+const {
+	MockAPIError,
+	MockBadRequestError,
+	MockAuthenticationError,
+	MockPermissionDeniedError,
+	MockInternalServerError,
+	MockRateLimitError,
+	MockNotFoundError,
+	MockConflictError,
+} = vi.hoisted(() => {
+	class MockAPIError extends Error {
+		status: number;
+		constructor(status: number, message = 'API error') {
+			super(message);
+			this.name = 'APIError';
+			this.status = status;
 		}
-		class MockBadRequestError extends MockAPIError {
-			constructor(message = 'bad request') {
-				super(400, message);
-				this.name = 'BadRequestError';
-			}
+	}
+	class MockBadRequestError extends MockAPIError {
+		constructor(message = 'bad request') {
+			super(400, message);
+			this.name = 'BadRequestError';
 		}
-		class MockAuthenticationError extends MockAPIError {
-			constructor(message = 'unauthorized') {
-				super(401, message);
-				this.name = 'AuthenticationError';
-			}
+	}
+	class MockAuthenticationError extends MockAPIError {
+		constructor(message = 'unauthorized') {
+			super(401, message);
+			this.name = 'AuthenticationError';
 		}
-		class MockPermissionDeniedError extends MockAPIError {
-			constructor(message = 'forbidden') {
-				super(403, message);
-				this.name = 'PermissionDeniedError';
-			}
+	}
+	class MockPermissionDeniedError extends MockAPIError {
+		constructor(message = 'forbidden') {
+			super(403, message);
+			this.name = 'PermissionDeniedError';
 		}
-		class MockInternalServerError extends MockAPIError {
-			constructor(message = 'server error') {
-				super(500, message);
-				this.name = 'InternalServerError';
-			}
+	}
+	class MockInternalServerError extends MockAPIError {
+		constructor(message = 'server error') {
+			super(500, message);
+			this.name = 'InternalServerError';
 		}
-		return { MockAPIError, MockBadRequestError, MockAuthenticationError, MockPermissionDeniedError, MockInternalServerError };
-	},
-);
+	}
+	class MockRateLimitError extends MockAPIError {
+		constructor(message = 'rate limited') {
+			super(429, message);
+			this.name = 'RateLimitError';
+		}
+	}
+	class MockNotFoundError extends MockAPIError {
+		constructor(message = 'not found') {
+			super(404, message);
+			this.name = 'NotFoundError';
+		}
+	}
+	class MockConflictError extends MockAPIError {
+		constructor(message = 'conflict') {
+			super(409, message);
+			this.name = 'ConflictError';
+		}
+	}
+	return {
+		MockAPIError,
+		MockBadRequestError,
+		MockAuthenticationError,
+		MockPermissionDeniedError,
+		MockInternalServerError,
+		MockRateLimitError,
+		MockNotFoundError,
+		MockConflictError,
+	};
+});
 
 // src/index.ts narrows auth failures with `instanceof` against the SDK's error
 // classes, so the mocked module must export real classes for those names.
@@ -62,6 +96,8 @@ vi.mock('cloudflare', () => ({
 	AuthenticationError: MockAuthenticationError,
 	PermissionDeniedError: MockPermissionDeniedError,
 	InternalServerError: MockInternalServerError,
+	RateLimitError: MockRateLimitError,
+	NotFoundError: MockNotFoundError,
 }));
 
 // Mock pushNtfy to prevent actual notifications
@@ -557,7 +593,27 @@ describe('Worker fetch handler', () => {
 			mockCloudflareClient.user.tokens.verify.mockResolvedValue({ id: 'tid', status: 'active' } as any);
 		});
 
-		it('uses client IPv4 when ip4=auto and CF-Connecting-IP contains a dot', async () => {
+		it.each([
+			['a malformed connecting address', 'not-an-ip'],
+			['an over-long connecting address', 'x'.repeat(300)],
+			['a v4-mapped v6 connecting address', '::ffff:203.0.113.1'],
+			['no connecting address at all', null],
+		])('skips the ip4=auto slot on %s', async (_label, connectingIp) => {
+			// `auto` takes the connecting IP only when it really is of that
+			// family; a substring check would accept the mapped form here.
+			const request = createMockRequest('https://example.com/update?ip4=auto&hostnames=test.example.com', {
+				headers: validAuth,
+				connectingIp,
+			});
+
+			const response = await worker.fetch(request, env, ctx);
+
+			expect(response.status).toBe(422);
+			const body = (await response.json()) as any;
+			expect(body.error).toContain("Provide 'ip4' and/or 'ip6'");
+		});
+
+		it('uses the client address when ip4=auto and it is a valid IPv4 address', async () => {
 			mockCloudflareClient.zones.list.mockReturnValue(mockPage({ result: [] }));
 
 			const request = createMockRequest('https://example.com/update?ip4=auto&hostnames=test.example.com', {
@@ -772,6 +828,141 @@ describe('Worker fetch handler', () => {
 			expect(mockCloudflareClient.dns.records.update).toHaveBeenCalledTimes(1);
 		});
 
+		// The address reaches the Cloudflare API and the response body, so a
+		// substring check would let arbitrary caller text through.
+		it.each([
+			['an octet above 255', 'ip4=256.1.1.1'],
+			['too few octets', 'ip4=1.2.3'],
+			['too many octets', 'ip4=1.2.3.4.5'],
+			['a leading zero', 'ip4=01.2.3.4'],
+			['letters', 'ip4=a.b.c.d'],
+			['an embedded newline', 'ip4=1.2.3.4%0A%3Cscript%3E'],
+			['an eight-thousand character value', `ip4=${'x'.repeat(8000)}.`],
+			['an IPv6 address in the ip4 slot', 'ip4=%3A%3A1'],
+		])('rejects ip4 with %s', async (_label, param) => {
+			const request = createMockRequest(`https://example.com/update?${param}&hostnames=test.example.com`, { headers: validAuth });
+
+			const response = await worker.fetch(request, env, ctx);
+
+			expect(response.status).toBe(422);
+			const body = (await response.json()) as any;
+			expect(body.error).toBe("The 'ip4' parameter must be a valid IPv4 address.");
+		});
+
+		it.each([
+			['a doubled elision', '2001:db8::1::2'],
+			['too many groups', '2001:db8:0:0:0:0:0:0:1'],
+			['too few groups without elision', '2001:db8:0:0:0:0:0'],
+			['a non-hex group', 'gggg::1'],
+			['an over-long group', '12345::1'],
+			['an IPv4 address in the ip6 slot', '1.2.3.4'],
+			['a bad embedded dotted quad', '2001:db8::ffff:1.2.3.256'],
+			// The URL parser rewrites the dotted tail to hex while RFC 5952 keeps
+			// it, so the two spellings would never compare equal against the
+			// stored record. An AAAA holding a v4-mapped address is not a useful
+			// DDNS target anyway. Both spellings of the same address, because
+			// refusing only the dotted one lets the identical address through by
+			// the other name and flaps exactly the same way.
+			['a v4-mapped address', '::ffff:192.168.1.1'],
+			['an uppercase v4-mapped address', '::FFFF:203.0.113.9'],
+			['a v4-mapped address spelled in hex', '::ffff:cb00:7101'],
+			['a v4-mapped address spelled in uppercase hex', '::FFFF:C000:221'],
+			['a v4-mapped address with a leading elision', '0:0:0:0:0:ffff:1:2'],
+			// Stray colons: a check that splits on ':' and drops empty groups
+			// accepts every one of these.
+			['a triple colon', ':::'],
+			['a triple colon between groups', '1:::2'],
+			['a trailing colon after an elision', '1::2:'],
+			['a leading single colon', ':1:2:3:4:5:6:7:8'],
+			['a trailing single colon', '1:2:3:4:5:6:7:8:'],
+			['a bracket escape attempt', '::1]/@evil.example'],
+			['a zone identifier', '::1%eth0'],
+			['a CIDR suffix', '::1/64'],
+		])('rejects ip6 with %s', async (_label, value) => {
+			const request = createMockRequest(`https://example.com/update?ip6=${encodeURIComponent(value)}&hostnames=test.example.com`, {
+				headers: validAuth,
+			});
+
+			const response = await worker.fetch(request, env, ctx);
+
+			expect(response.status).toBe(422);
+			const body = (await response.json()) as any;
+			expect(body.error).toBe("The 'ip6' parameter must be a valid IPv6 address.");
+		});
+
+		it.each([
+			['a dotted quad', 'ip4', '1.2.3.4'],
+			['the unspecified v4 address', 'ip4', '0.0.0.0'],
+			['the broadcast address', 'ip4', '255.255.255.255'],
+			['a compressed v6 address', 'ip6', '2001:db8::1'],
+			['v6 loopback', 'ip6', '::1'],
+			['the unspecified v6 address', 'ip6', '::'],
+			['a fully expanded v6 address', 'ip6', '2001:0db8:0000:0000:0000:0000:0000:0001'],
+		])('accepts %s', async (_label, param, value) => {
+			mockCloudflareClient.zones.list.mockReturnValue(mockPage({ result: [] }));
+
+			const request = createMockRequest(`https://example.com/update?${param}=${encodeURIComponent(value)}&hostnames=test.example.com`, {
+				headers: validAuth,
+			});
+
+			const response = await worker.fetch(request, env, ctx);
+			const body = (await response.json()) as any;
+
+			// Refused later for having no zones, never for the address itself.
+			expect(response.status).toBe(400);
+			expect(body.error).toBe('No zones available with current permissions.');
+		});
+
+		// Canonicalising is the reason this function returns a value rather than
+		// a boolean: Cloudflare stores the canonical form, so forwarding another
+		// spelling leaves the comparison permanently unequal and every poll
+		// issues a real update, an audit row, and a notification.
+		it.each([
+			['an uppercase v6 address', '2001:0DB8::1', '2001:db8::1'],
+			['a fully expanded v6 address', '2001:0db8:0000:0000:0000:0000:0000:0001', '2001:db8::1'],
+			['a v6 address with leading zeros in a group', '2001:db8:0:0:0:0:0:0001', '2001:db8::1'],
+		])('stores the canonical spelling of %s', async (_label, sent, canonical) => {
+			mockCloudflareClient.zones.list.mockReturnValue(mockPage({ result: [{ id: 'zone1', name: 'example.com' }] }));
+			mockCloudflareClient.dns.records.list.mockReturnValue(
+				mockPage({ result: [{ id: 'r1', name: 'test.example.com', type: 'AAAA', content: '2001:db8::9', proxied: false, ttl: 1 }] }),
+			);
+			mockCloudflareClient.dns.records.update.mockResolvedValue(undefined);
+
+			const request = createMockRequest(`https://example.com/update?ip6=${encodeURIComponent(sent)}&hostnames=test.example.com`, {
+				headers: validAuth,
+			});
+
+			const response = await worker.fetch(request, env, ctx);
+			const body = (await response.json()) as any;
+
+			expect(response.status).toBe(200);
+			expect(mockCloudflareClient.dns.records.update).toHaveBeenCalledWith('r1', expect.objectContaining({ content: canonical }));
+			expect(body.data.records[0].ip).toBe(canonical);
+		});
+
+		it('treats a differently spelled but identical address as no change', async () => {
+			// The flap this prevents: a record already holding the canonical form
+			// would otherwise be rewritten on every poll.
+			mockCloudflareClient.zones.list.mockReturnValue(mockPage({ result: [{ id: 'zone1', name: 'example.com' }] }));
+			mockCloudflareClient.dns.records.list.mockReturnValue(
+				mockPage({ result: [{ id: 'r1', name: 'test.example.com', type: 'AAAA', content: '2001:db8::1', proxied: false, ttl: 1 }] }),
+			);
+
+			const request = createMockRequest(
+				'https://example.com/update?ip6=2001%3A0DB8%3A0000%3A0000%3A0000%3A0000%3A0000%3A0001&hostnames=test.example.com',
+				{
+					headers: validAuth,
+				},
+			);
+
+			const response = await worker.fetch(request, env, ctx);
+			const body = (await response.json()) as any;
+
+			expect(response.status).toBe(200);
+			expect(body.data.updated).toBe(false);
+			expect(mockCloudflareClient.dns.records.update).not.toHaveBeenCalled();
+		});
+
 		// Query parameters arrive percent-decoded, so an unchecked hostname
 		// carries whatever the caller encoded into the log lines that quote it.
 		it.each([
@@ -828,6 +1019,54 @@ describe('Worker fetch handler', () => {
 			const body = (await response.json()) as any;
 			expect(body.error).toContain('exceeds 253 characters');
 			expect((vi.mocked(env.DDNS_KV) as any).get).not.toHaveBeenCalled();
+		});
+
+		// The zone parameter is held to the same shape as a hostname. It reaches
+		// the log lines that quote it, the refusal tally, and the /history
+		// response that echoes the tally back to the caller.
+		it.each([
+			['an embedded newline', 'x%0AError+handling+request:+forged'],
+			['a space', 'has%20space.example'],
+			['an underscore', 'under_score.example'],
+			['a value longer than a DNS name may be', `${'a'.repeat(250)}.example.com`],
+		])('rejects a zone parameter with %s', async (_label, encoded) => {
+			const request = createMockRequest(`https://example.com/update?ip4=1.2.3.4&hostnames=a.example.com&zone=${encoded}`, {
+				headers: validAuth,
+			});
+
+			const response = await worker.fetch(request, env, ctx);
+
+			expect(response.status).toBe(422);
+			const body = (await response.json()) as any;
+			expect(body.error).toContain('Not a valid zone name');
+			// The echoed value is re-encoded, so a newline cannot break the line.
+			expect(body.error).not.toContain('\n');
+		});
+
+		it.each([
+			['zone', `zone=${'a'.repeat(59)}${encodeURIComponent('\u{1F600}')}.example.com&hostnames=a.example.com`],
+			['hostnames', `hostnames=${'a'.repeat(59)}${encodeURIComponent('\u{1F600}')}${'b'.repeat(250)}.example.com`],
+		])('answers an astral character on the %s truncation boundary with 422, not 500', async (_label, query) => {
+			// The message quotes a shortened copy of the value. Cutting UTF-16
+			// units lands mid-pair at exactly this offset, and encoding a lone
+			// surrogate throws, which would turn a rejected input into the 500 a
+			// DDNS client retries against forever.
+			const request = createMockRequest(`https://example.com/update?ip4=1.2.3.4&${query}`, { headers: validAuth });
+
+			const response = await worker.fetch(request, env, ctx);
+
+			expect(response.status).toBe(422);
+		});
+
+		it('pins the content type so nothing sniffs a caller-supplied value', async () => {
+			const request = createMockRequest('https://example.com/update?ip4=1.2.3.4&hostnames=a.example.com&zone=under_score.example', {
+				headers: validAuth,
+			});
+
+			const response = await worker.fetch(request, env, ctx);
+
+			expect(response.headers.get('Content-Type')).toBe('application/json');
+			expect(response.headers.get('X-Content-Type-Options')).toBe('nosniff');
 		});
 
 		it('trims whitespace from ip4 parameter', async () => {
@@ -1632,6 +1871,443 @@ describe('Worker fetch handler', () => {
 	// Zone and record matching
 	// -------------------------------------------------------------------------
 
+	// ---------------------------------------------------------------------------
+	// Refusal counter  (one Durable Object per token)
+	// ---------------------------------------------------------------------------
+
+	describe('Refusal counter', () => {
+		const validAuth = { Authorization: createAuthHeader('user@example.com', 'token') };
+
+		beforeEach(() => {
+			mockCloudflareClient.user.tokens.verify.mockResolvedValue({ id: 'token-id-123', status: 'active' } as any);
+			vi.spyOn(console, 'error').mockImplementation(() => {});
+		});
+
+		/** The hostname lists handed to the caller's own counter instance. */
+		const refusalCalls = (): string[][] => {
+			// getByName hands back the same stub per token, so read that stub once
+			// rather than collecting across every call that returned it.
+			const stub = ((vi.mocked(env.REFUSALS) as any).getByName as (id: string) => { add: { mock: { calls: [string, string[]][] } } })(
+				'token-id-123',
+			);
+			return stub.add.mock.calls.map(([, hostnames]) => hostnames);
+		};
+
+		/** Refusals counted against the caller, repeats included. */
+		const counted = (): number => refusalCalls().reduce((total, hostnames) => total + hostnames.length, 0);
+
+		/** The distinct names counted against the caller. */
+		const countedNames = (): string[] => [...new Set(refusalCalls().flat())];
+
+		/** The token holds example.com, so a name under elsewhere.com is a reach
+		 * past its authority. A record missing inside example.com is not. */
+		const outsideAuthority = (): void => {
+			mockCloudflareClient.zones.list.mockReturnValue(mockPage({ result: [{ id: 'zone1', name: 'example.com' }] }));
+			mockCloudflareClient.dns.records.list.mockReturnValue(mockPage({ result: [] }));
+		};
+
+		const settle = async (): Promise<void> => {
+			await Promise.allSettled((waitUntilMock.mock.calls as [Promise<void>][]).map(([p]) => p));
+		};
+
+		it('counts every refusal in a batch however the caller orders it', async () => {
+			// The evasion against a row-per-event design is to pad the batch so
+			// the probed name is the one dropped. A tally has no selection to
+			// steer, and no window to aim a burst at.
+			outsideAuthority();
+			const padded = [
+				'p1.elsewhere.com',
+				'p2.elsewhere.com',
+				'p3.elsewhere.com',
+				'p4.elsewhere.com',
+				'p5.elsewhere.com',
+				'probe.elsewhere.com',
+			];
+
+			const request = createMockRequest(`https://example.com/update?ip4=1.2.3.4&hostnames=${padded.join(',')}`, {
+				headers: validAuth,
+			});
+
+			await worker.fetch(request, env, ctx);
+			await settle();
+
+			expect(counted()).toBe(6);
+			expect((vi.mocked(env.REFUSALS) as any).getByName).toHaveBeenCalledWith('token-id-123');
+		});
+
+		it('loses nothing when a burst is followed by silence', async () => {
+			// Nothing is deferred, so no tally waits on a successor request that
+			// may never come.
+			outsideAuthority();
+
+			for (let i = 0; i < 5; i++) {
+				const request = createMockRequest('https://example.com/update?ip4=1.2.3.4&hostnames=a.elsewhere.com,b.elsewhere.com', {
+					headers: validAuth,
+				});
+				await worker.fetch(request, env, ctx);
+			}
+			await settle();
+
+			expect(counted()).toBe(10);
+		});
+
+		it('reads back what it counted', async () => {
+			outsideAuthority();
+
+			const update = createMockRequest('https://example.com/update?ip4=1.2.3.4&hostnames=a.elsewhere.com,b.elsewhere.com', {
+				headers: validAuth,
+			});
+			await worker.fetch(update, env, ctx);
+			await settle();
+
+			const history = createMockRequest('https://example.com/history', { headers: validAuth });
+			const body = (await (await worker.fetch(history, env, ctx)).json()) as any;
+
+			// The names come back too: the caller owns every hostname in the
+			// list, and seeing which ones were refused is what makes the tally
+			// worth anything to the party reading it.
+			expect(body.data.refusedToday).toEqual({
+				total: 2,
+				distinct: 2,
+				hostnames: ['a.elsewhere.com', 'b.elsewhere.com'],
+			});
+		});
+
+		it('counts a zone filter naming a zone the token cannot see', async () => {
+			// It refuses before any record lookup, which makes it the cheapest
+			// probe available and exactly what the counter must not be blind to.
+			mockCloudflareClient.zones.list.mockReturnValue(mockPage({ result: [{ id: 'zone1', name: 'example.com' }] }));
+
+			const request = createMockRequest('https://example.com/update?ip4=1.2.3.4&hostnames=a.example.com&zone=other.example', {
+				headers: validAuth,
+			});
+
+			const response = await worker.fetch(request, env, ctx);
+			await settle();
+
+			expect(response.status).toBe(400);
+			expect(countedNames()).toEqual(['other.example']);
+		});
+
+		it('does not count a token that sees no zones at all', async () => {
+			// An account with no zones yet, or a token scoped to none, is a setup
+			// state every new user passes through. Counting it would put them in
+			// the tally on their first afternoon.
+			mockCloudflareClient.zones.list.mockReturnValue(mockPage({ result: [] }));
+
+			const request = createMockRequest('https://example.com/update?ip4=1.2.3.4&hostnames=a.example.com', {
+				headers: validAuth,
+			});
+
+			const response = await worker.fetch(request, env, ctx);
+			await settle();
+
+			expect(response.status).toBe(400);
+			expect(counted()).toBe(0);
+		});
+
+		it('caches an empty zone list only briefly', async () => {
+			// Two failure modes bracket this. The full TTL would keep answering
+			// "no zones" after the account's first zone exists; no cache at all
+			// would walk the API on every request from a zone-less token, with
+			// nothing bounding the rate.
+			mockCloudflareClient.zones.list.mockReturnValue(mockPage({ result: [] }));
+
+			const request = createMockRequest('https://example.com/update?ip4=1.2.3.4&hostnames=a.example.com', { headers: validAuth });
+
+			await worker.fetch(request, env, ctx);
+			await settle();
+
+			expect((vi.mocked(env.DDNS_KV) as any).put).toHaveBeenCalledWith('zones:token-id-123', '[]', { expirationTtl: 60 });
+			// Written, not merely attempted. KV refuses a TTL under 60 and the
+			// worker swallows the refusal, so asserting the call alone would pass
+			// against a cache that never exists.
+			await expect((vi.mocked(env.DDNS_KV) as any).get('zones:token-id-123')).resolves.toBe('[]');
+		});
+
+		it('reads the empty zone list back rather than walking the API again', async () => {
+			mockCloudflareClient.zones.list.mockReturnValue(mockPage({ result: [] }));
+
+			for (let poll = 0; poll < 5; poll++) {
+				const request = createMockRequest('https://example.com/update?ip4=1.2.3.4&hostnames=a.example.com', { headers: validAuth });
+				await worker.fetch(request, env, ctx);
+				await settle();
+			}
+
+			expect(mockCloudflareClient.zones.list).toHaveBeenCalledTimes(1);
+		});
+
+		it.each([
+			['a permission failure', 'MockPermissionDeniedError', 403, 'needs Zone'],
+			['a revoked token', 'MockAuthenticationError', 401, 'Authentication failed'],
+			['a rate limit', 'MockRateLimitError', 429, 'rate limiting'],
+		])('answers %s while listing zones with an actionable status', async (_label, errorName, status, fragment) => {
+			// A token with DNS edit but no Zone Read is the documented setup
+			// mistake, and it fails here rather than on a record lookup. Left
+			// alone it became a 500, which a DDNS client retries against forever.
+			const failures: Record<string, new () => Error> = {
+				MockPermissionDeniedError,
+				MockAuthenticationError,
+				MockRateLimitError,
+			};
+			const Failure = failures[errorName] ?? MockAuthenticationError;
+			mockCloudflareClient.zones.list.mockImplementation(() => ({
+				[Symbol.asyncIterator]: () => ({
+					next: () => Promise.reject(new Failure()),
+				}),
+			}));
+
+			const request = createMockRequest('https://example.com/update?ip4=1.2.3.4&hostnames=a.elsewhere.com', { headers: validAuth });
+
+			const response = await worker.fetch(request, env, ctx);
+			await settle();
+			const body = (await response.json()) as any;
+
+			expect(response.status).toBe(status);
+			expect(body.error).toContain(fragment);
+			// Neither counts: a token missing a scope is the documented setup
+			// mistake, not a reach past authority.
+			expect(counted()).toBe(0);
+		});
+
+		/** Threshold-crossing warnings, which is all this describe block reads. */
+		const crossings = (warnSpy: { mock: { calls: unknown[][] } }): string[] =>
+			warnSpy.mock.calls
+				.map((call) => call[0])
+				.filter((msg): msg is string => typeof msg === 'string' && msg.includes('reached past its authority'));
+
+		it('logs once when a token crosses the refusal threshold', async () => {
+			// The tally is otherwise readable only through /history, which is
+			// scoped to the very token being counted, so a prober would be the
+			// only party who could see it.
+			const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+			outsideAuthority();
+
+			// 40 fresh names per request, so the 100-distinct threshold falls
+			// inside the third and the fourth must not report it again.
+			for (let round = 0; round < 4; round++) {
+				const hostnames = Array.from({ length: 40 }, (_unused, i) => `r${String(round)}h${String(i)}.elsewhere.com`).join(',');
+				const request = createMockRequest(`https://example.com/update?ip4=1.2.3.4&hostnames=${hostnames}`, { headers: validAuth });
+				await worker.fetch(request, env, ctx);
+				await settle();
+			}
+
+			expect(crossings(warnSpy)).toHaveLength(1);
+			expect(crossings(warnSpy)[0]).toContain('120 distinct hostnames today');
+		});
+
+		it('never crosses the threshold on one hostname however long it is retried', async () => {
+			// The reason the threshold counts distinct names. A DDNS client polls
+			// every two minutes, so one hostname typed wrong passes any total
+			// given an afternoon, and the alert would fire on a typo forever.
+			const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+			outsideAuthority();
+
+			for (let poll = 0; poll < 200; poll++) {
+				const request = createMockRequest('https://example.com/update?ip4=1.2.3.4&hostnames=typo.elsewhere.com', { headers: validAuth });
+				await worker.fetch(request, env, ctx);
+			}
+			await settle();
+
+			expect(counted()).toBe(200);
+			expect(countedNames()).toEqual(['typo.elsewhere.com']);
+			expect(crossings(warnSpy)).toHaveLength(0);
+		});
+
+		it('does not count a permission failure from the Cloudflare API', async () => {
+			mockCloudflareClient.zones.list.mockReturnValue(mockPage({ result: [{ id: 'zone1', name: 'example.com' }] }));
+			mockCloudflareClient.dns.records.list.mockImplementation(() => ({
+				then: (_r: any, reject: any) => reject(new MockPermissionDeniedError()),
+			}));
+
+			const request = createMockRequest('https://example.com/update?ip4=1.2.3.4&hostnames=a.example.com', {
+				headers: validAuth,
+			});
+
+			const response = await worker.fetch(request, env, ctx);
+			await settle();
+
+			expect(response.status).toBe(403);
+			// The zone was already confirmed to be on the token, so a 403 here is
+			// a missing DNS scope: a setup mistake, not a reach past authority.
+			expect(counted()).toBe(0);
+		});
+
+		it('answers a revoked token with 401 and does not count it', async () => {
+			// A token revoked between verify and the record call is a credential
+			// event, not the caller overreaching.
+			mockCloudflareClient.zones.list.mockReturnValue(mockPage({ result: [{ id: 'zone1', name: 'example.com' }] }));
+			mockCloudflareClient.dns.records.list.mockImplementation(() => ({
+				then: (_r: any, reject: any) => reject(new MockAuthenticationError()),
+			}));
+
+			const request = createMockRequest('https://example.com/update?ip4=1.2.3.4&hostnames=a.example.com', {
+				headers: validAuth,
+			});
+
+			const response = await worker.fetch(request, env, ctx);
+			await settle();
+			const body = (await response.json()) as any;
+
+			expect(response.status).toBe(401);
+			expect(body.error).toBe('Authentication failed: invalid token.');
+			expect(counted()).toBe(0);
+		});
+
+		it('does not count a transport failure against the caller', async () => {
+			// The signal is a caller reaching for what it has no claim to, not
+			// Cloudflare being unreachable.
+			mockCloudflareClient.zones.list.mockReturnValue(mockPage({ result: [{ id: 'zone1', name: 'example.com' }] }));
+			mockCloudflareClient.dns.records.list.mockImplementation(() => ({
+				then: (_r: any, reject: any) => reject(new MockInternalServerError()),
+			}));
+
+			const request = createMockRequest('https://example.com/update?ip4=1.2.3.4&hostnames=a.example.com', {
+				headers: validAuth,
+			});
+
+			const response = await worker.fetch(request, env, ctx);
+			await settle();
+
+			expect(response.status).toBe(500);
+			expect(counted()).toBe(0);
+		});
+
+		it('does not count anything when every record succeeds', async () => {
+			wireStandardHappyPath(mockCloudflareClient);
+			(vi.mocked(env.DDNS_KV) as any).get.mockResolvedValue(null);
+
+			const request = createMockRequest('https://example.com/update?ip4=1.2.3.5&hostnames=test.example.com', {
+				headers: validAuth,
+			});
+
+			await worker.fetch(request, env, ctx);
+			await settle();
+
+			expect(counted()).toBe(0);
+		});
+
+		/** Refuses once against a freshly discovered list, leaving it cached. */
+		const refuseOnce = async (): Promise<void> => {
+			const request = createMockRequest('https://example.com/update?ip4=1.2.3.4&hostnames=a.elsewhere.com', { headers: validAuth });
+			await worker.fetch(request, env, ctx);
+			await settle();
+		};
+
+		it('keeps the cached zone list when a hostname is refused', async () => {
+			// A zone added since the list was cached does read like a reach past
+			// authority. Clearing on that reading costs a full zone walk on every
+			// poll for as long as one hostname stays misspelled, and a
+			// misspelling outlives any zone change.
+			outsideAuthority();
+			await refuseOnce();
+
+			await refuseOnce();
+
+			expect((vi.mocked(env.DDNS_KV) as any).delete).not.toHaveBeenCalledWith('zones:token-id-123');
+		});
+
+		it('walks the zone list once however long a hostname stays misspelled', async () => {
+			// The cost bound the README's throughput section rests on. A token
+			// can hold up to ZONE_LIST_MAX zones, so a per-request walk is the
+			// worst amplification available to a caller that reaches the API.
+			outsideAuthority();
+
+			for (let poll = 0; poll < 10; poll++) {
+				await refuseOnce();
+			}
+
+			expect(mockCloudflareClient.zones.list).toHaveBeenCalledTimes(1);
+		});
+
+		it('does not count a token whose zone list hit the ceiling', async () => {
+			// The walk stops at ZONE_LIST_MAX, so a hostname in a zone past it was
+			// never looked for rather than reached for. Counting it would put the
+			// largest legitimate accounts in the tally, which is the population
+			// the alert exists to exclude.
+			vi.spyOn(console, 'warn').mockImplementation(() => {});
+			const zones = Array.from({ length: 1200 }, (_unused, i) => ({ id: `zone${String(i)}`, name: `z${String(i)}.example.net` }));
+			mockCloudflareClient.zones.list.mockReturnValue(mockPage({ result: zones }));
+
+			const request = createMockRequest('https://example.com/update?ip4=1.2.3.4&hostnames=a.elsewhere.com', { headers: validAuth });
+			const response = await worker.fetch(request, env, ctx);
+			await settle();
+
+			expect(response.status).toBe(400);
+			expect(counted()).toBe(0);
+		});
+
+		it('counts a dual-stack hostname once, not once per family', async () => {
+			// ip4 and ip6 make one hostname two records and two failures. Counting
+			// both would make a dual-stack caller look twice as persistent as a
+			// single-stack one asking the identical question.
+			outsideAuthority();
+
+			const request = createMockRequest('https://example.com/update?ip4=1.2.3.4&ip6=2001:db8::1&hostnames=a.elsewhere.com', {
+				headers: validAuth,
+			});
+			await worker.fetch(request, env, ctx);
+			await settle();
+
+			expect(counted()).toBe(1);
+			expect(countedNames()).toEqual(['a.elsewhere.com']);
+		});
+
+		it('does not count a name the token holds but the caller scoped out', async () => {
+			// The caller's own `zone=` narrowing is not the token's permissions.
+			// Counting it would put ordinary scoped traffic in the tally, and the
+			// README defines a refusal as a name no zone on the token could hold.
+			mockCloudflareClient.zones.list.mockReturnValue(
+				mockPage({
+					result: [
+						{ id: 'zone1', name: 'example.com' },
+						{ id: 'zone2', name: 'other.example' },
+					],
+				}),
+			);
+
+			const request = createMockRequest('https://example.com/update?ip4=1.2.3.4&hostnames=b.other.example&zone=example.com', {
+				headers: validAuth,
+			});
+			const response = await worker.fetch(request, env, ctx);
+			await settle();
+			const body = (await response.json()) as any;
+
+			expect(response.status).toBe(400);
+			expect(body.error).toContain("outside the zone requested with 'zone='");
+			expect(counted()).toBe(0);
+		});
+
+		it('does not fail the request when the counter is unreachable', async () => {
+			(vi.mocked(env.REFUSALS) as any).getByName.mockImplementation(() => {
+				throw new Error('Durable Object unavailable');
+			});
+			outsideAuthority();
+
+			const request = createMockRequest('https://example.com/update?ip4=1.2.3.4&hostnames=a.elsewhere.com', {
+				headers: validAuth,
+			});
+
+			const response = await worker.fetch(request, env, ctx);
+			await expect(Promise.all((waitUntilMock.mock.calls as [Promise<void>][]).map(([p]) => p))).resolves.toBeDefined();
+
+			expect(response.status).toBe(400);
+		});
+
+		it('reports zero rather than failing when the counter cannot be read', async () => {
+			(vi.mocked(env.REFUSALS) as any).getByName.mockImplementation(() => {
+				throw new Error('Durable Object unavailable');
+			});
+
+			const request = createMockRequest('https://example.com/history', { headers: validAuth });
+
+			const response = await worker.fetch(request, env, ctx);
+			const body = (await response.json()) as any;
+
+			expect(response.status).toBe(200);
+			expect(body.data.refusedToday).toEqual({ total: 0, distinct: 0, hostnames: [] });
+		});
+	});
 	describe('Zone and record matching', () => {
 		const validAuth = { Authorization: createAuthHeader('user@example.com', 'token') };
 
@@ -1911,6 +2587,18 @@ describe('Worker fetch handler', () => {
 			expect(body).toEqual({
 				success: false,
 				error: "No matching record found for 'test.example.com'. Create it manually first.",
+				data: {
+					updated: false,
+					records: [{ hostname: 'test.example.com', type: 'A', ip: '1.2.3.4', updated: false }],
+					failed: [
+						{
+							hostname: 'test.example.com',
+							type: 'A',
+							status: 400,
+							error: "No matching record found for 'test.example.com'. Create it manually first.",
+						},
+					],
+				},
 			});
 		});
 
@@ -1940,6 +2628,18 @@ describe('Worker fetch handler', () => {
 			expect(body).toEqual({
 				success: false,
 				error: "Multiple matching records found for 'test.example.com'. Specify a unique hostname per zone.",
+				data: {
+					updated: false,
+					records: [{ hostname: 'test.example.com', type: 'A', ip: '1.2.3.5', updated: false }],
+					failed: [
+						{
+							hostname: 'test.example.com',
+							type: 'A',
+							status: 400,
+							error: "Multiple matching records found for 'test.example.com'. Specify a unique hostname per zone.",
+						},
+					],
+				},
 			});
 		});
 
@@ -2333,7 +3033,21 @@ describe('Worker fetch handler', () => {
 			expect(body.success).toBe(false);
 			expect(body.data).toEqual({
 				updated: true,
-				records: [{ hostname: 'good.example.com', type: 'A', ip: '1.2.3.4', updated: true }],
+				records: [
+					{ hostname: 'good.example.com', type: 'A', ip: '1.2.3.4', updated: true },
+					// Present with updated: false, and named in `failed` below.
+					// A record that was already current carries the same flag, so
+					// the change list alone cannot tell the two apart.
+					{ hostname: 'missing.example.com', type: 'A', ip: '1.2.3.4', updated: false },
+				],
+				failed: [
+					{
+						hostname: 'missing.example.com',
+						type: 'A',
+						status: 400,
+						error: "No matching record found for 'missing.example.com'. Create it manually first.",
+					},
+				],
 			});
 		});
 
@@ -2358,6 +3072,97 @@ describe('Worker fetch handler', () => {
 
 			expect(response.status).toBe(400);
 			expect(body.error).toContain("No matching record found for 'zzz.example.com'");
+			// The status can only describe one record. Without the rest beside
+			// it, a caller reading a terminal 400 stops retrying the transient
+			// 500 on the record next to it, and that record never recovers.
+			expect(body.data.failed).toEqual([
+				{ hostname: 'aaa.example.com', type: 'A', status: 500, error: 'Internal Server Error' },
+				{
+					hostname: 'zzz.example.com',
+					type: 'A',
+					status: 400,
+					error: "No matching record found for 'zzz.example.com'. Create it manually first.",
+				},
+			]);
+		});
+
+		it.each([
+			['a permission failure', 'MockPermissionDeniedError', 403, 'The API token lacks permission for this record.'],
+			['a rate limit', 'MockRateLimitError', 429, 'The Cloudflare API is rate limiting this token. Retry later.'],
+			['a revoked token', 'MockAuthenticationError', 401, 'Authentication failed: invalid token.'],
+			[
+				'a record Cloudflare rejects',
+				'MockBadRequestError',
+				400,
+				'Cloudflare rejected this record. Check that the name exists and its type matches the address family.',
+			],
+			['a zone that is gone', 'MockNotFoundError', 404, 'Cloudflare no longer has this zone or record.'],
+			// 409 stands for every other terminal answer the API can give. None
+			// have a branch of their own, and reporting them as 500 would send a
+			// client to retry a request that can never succeed.
+			['any other terminal answer', 'MockConflictError', 409, 'Cloudflare rejected this record.'],
+		])('categorises %s against the record it happened to', async (_label, errorName, status, message) => {
+			// Translated, not forwarded: the upstream message is Cloudflare's and
+			// says nothing the caller can act on.
+			const failures: Record<string, new () => Error> = {
+				MockPermissionDeniedError,
+				MockRateLimitError,
+				MockAuthenticationError,
+				MockBadRequestError,
+				MockNotFoundError,
+				MockConflictError,
+			};
+			const Failure = failures[errorName] ?? MockInternalServerError;
+			mockCloudflareClient.zones.list.mockReturnValue(mockPage({ result: [{ id: 'zone1', name: 'example.com' }] }));
+			mockCloudflareClient.dns.records.list.mockImplementation(() => ({
+				then: (_r: any, reject: any) => reject(new Failure()),
+			}));
+
+			const request = createMockRequest('https://example.com/update?ip4=1.2.3.4&hostnames=a.example.com', { headers: validAuth });
+
+			const response = await worker.fetch(request, env, ctx);
+			const body = (await response.json()) as any;
+
+			expect(body.data.failed).toEqual([{ hostname: 'a.example.com', type: 'A', status, error: message }]);
+			// The status too, not only the per-record list. A body that says 429
+			// under a 500 sends the client to retry against a throttled token.
+			expect(response.status).toBe(status);
+			expect(body.error).toBe(message);
+		});
+
+		it.each([
+			['a dead credential over a record that could be fixed', 'MockAuthenticationError', 'MockNotFoundError', 401],
+			['a terminal answer over a transient one', 'MockNotFoundError', 'MockInternalServerError', 404],
+			['a terminal answer over a rate limit', 'MockPermissionDeniedError', 'MockRateLimitError', 403],
+		])('reports %s', async (_label, firstName, secondName, status) => {
+			// One status has to speak for a mixed batch. Every record's own
+			// verdict is in data.failed either way, so the choice is about which
+			// one a client acting on the status alone should see.
+			const failures: Record<string, new () => Error> = {
+				MockAuthenticationError,
+				MockNotFoundError,
+				MockInternalServerError,
+				MockPermissionDeniedError,
+				MockRateLimitError,
+			};
+			const First = failures[firstName] ?? MockInternalServerError;
+			const Second = failures[secondName] ?? MockInternalServerError;
+			mockCloudflareClient.zones.list.mockReturnValue(mockPage({ result: [{ id: 'zone1', name: 'example.com' }] }));
+			mockCloudflareClient.dns.records.list.mockImplementation((params: any) => ({
+				then: (_r: any, reject: any) => reject(params.name.exact === 'first.example.com' ? new First() : new Second()),
+			}));
+
+			const request = createMockRequest('https://example.com/update?ip4=1.2.3.4&hostnames=first.example.com,second.example.com', {
+				headers: validAuth,
+			});
+
+			const response = await worker.fetch(request, env, ctx);
+			const body = (await response.json()) as any;
+
+			expect(response.status).toBe(status);
+			// Whichever lost still reports its own verdict, so a client that
+			// reads the list never loses the record the status did not describe.
+			expect(body.data.failed).toHaveLength(2);
 		});
 
 		it('returns 500 when every failure is a transport error', async () => {
@@ -2374,7 +3179,15 @@ describe('Worker fetch handler', () => {
 			const body = (await response.json()) as any;
 
 			expect(response.status).toBe(500);
-			expect(body).toEqual({ success: false, error: 'Internal Server Error' });
+			expect(body).toEqual({
+				success: false,
+				error: 'Internal Server Error',
+				data: {
+					updated: false,
+					records: [{ hostname: 'a.example.com', type: 'A', ip: '1.2.3.4', updated: false }],
+					failed: [{ hostname: 'a.example.com', type: 'A', status: 500, error: 'Internal Server Error' }],
+				},
+			});
 		});
 
 		it('logs every failure in a batch, not only the one it reports', async () => {
@@ -2524,6 +3337,21 @@ describe('Worker fetch handler', () => {
 
 		beforeEach(() => {
 			mockCloudflareClient.user.tokens.verify.mockResolvedValue({ id: 'token-id-123', status: 'active' } as any);
+		});
+
+		it.each([
+			['a fractional limit', '3.7'],
+			['a limit just above an integer', '1.0000001'],
+		])('truncates %s rather than binding a real to LIMIT', async (_label, limit) => {
+			// SQLite rejects a REAL bound to LIMIT, which surfaced as a 500 on a
+			// value the caller supplied.
+			const request = createMockRequest(`https://example.com/history?limit=${limit}`, { headers: validAuth });
+
+			const response = await worker.fetch(request, env, ctx);
+
+			expect(response.status).toBe(200);
+			const bindArgs = (vi.mocked(env.AUDIT_DB) as any).prepare().bind.mock.calls.at(-1) as unknown[];
+			expect(Number.isInteger(bindArgs.at(-1))).toBe(true);
 		});
 
 		it('returns 200 with events array using default limit of 100', async () => {

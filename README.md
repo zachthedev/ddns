@@ -10,7 +10,7 @@ A Cloudflare Worker that lets UniFi OS devices (UDM and UXG series) dynamically 
 ## Features
 
 - **Push notifications** - Per-caller [ntfy](https://ntfy.sh) alerts via the `ntfy=` parameter (self-hosted servers supported), sent only when a DNS record actually changes
-- **Multi-hostname updates** - Comma-separated hostnames in a single entry, including across multiple zones
+- **Multi-hostname updates** - Comma-separated hostnames in a single entry, including across multiple zones, with every record's own outcome reported when a batch fails part-way
 - **Multi-zone tokens** - One token can manage records in several zones, with optional `zone=` scoping
 - **Dual-stack** - Explicit `ip4`/`ip6` parameters with family-aware `auto`, updating A and AAAA together
 - **Record preservation** - Proxy status, TTL, and comments on existing records survive updates
@@ -107,6 +107,47 @@ curl -H "Authorization: Bearer <api-token>" -H "X-Access-Key: <access-key-if-set
 
 Cache fast-path hits are not recorded; only requests that reached the DNS API produce events.
 
+The response also carries `data.refusedToday`: the times this token reached past its own authority today,
+UTC, and the names it reached for.
+
+```json
+{ "total": 47, "distinct": 2, "hostnames": ["typo.example.net", "old.example.net"] }
+```
+
+Reaching past authority means a hostname no zone on the token could hold, or a `zone=` naming a zone it
+cannot see. A record you have not created yet is **not** counted, nor is a token missing the Zone Read
+scope, nor is a token that sees no zones at all: those are setup steps, and counting them would bury the
+signal under every new user's first afternoon. The `hostnames` list is your own, so it names exactly which
+of your entries to fix.
+
+Refusals are **counted, not recorded per event**. Any active Cloudflare token can produce them without
+limit, so a row apiece would let one caller grow a table every deployment shares. The tally lives in a
+Durable Object, one instance per token: requests to an instance serialize, so nothing is lost to a race and
+there is no batching window for a caller to time a burst against. Padding a batch changes the count, never
+what the count sees. It resets when the UTC day rolls.
+
+That moves per-caller growth rather than removing it: any active token that reaches past its authority
+creates one instance. Each holds a single key, keeps at most 200 distinct names, spends at most 699 writes
+a day before the tally goes quiet, and clears itself 24 to 48 hours after the last refusal, so the bound is
+the reclaim window rather than the decision to count.
+
+Crossing 100 **distinct** names in a day logs a warning to Workers Logs, because `/history` is scoped to
+the very token being counted: without the log the tally would only ever be visible to the caller it
+describes. Distinct rather than total, because a DDNS client polls every two minutes, so one hostname typed
+wrong passes any total given an afternoon. Variety is what a caller sweeping for names it does not hold
+produces and a misconfigured one does not.
+
+Three limits are worth stating plainly. The tally is keyed on the API token, and a Cloudflare account
+issues tokens freely, so an enumerator that rotates tokens before reaching the threshold never trips it.
+The per-record IP cache is consulted before zones are read, so for up to its own 30-day TTL after a token
+loses a zone, a name it used to hold still answers 200 and counts nothing; that is the record cache, not
+the 5-minute zone cache. And a zone added within the last five minutes reads as outside the token's
+authority until the zone cache expires. The warning is a cheap way to see a misconfigured or careless
+caller, not a control that stops a determined one.
+
+Nothing is counted against a token that sees more than 1000 zones. The zone walk stops at that ceiling, so
+a hostname in a zone past it was never looked for rather than reached for.
+
 ## ⚡ **Throughput & Cost**
 
 The worker is built to take heavy public traffic cheaply:
@@ -114,7 +155,7 @@ The worker is built to take heavy public traffic cheaply:
 - **Steady-state polling is API-free.** With the access key configured, a request whose records all match the KV cache answers with zero Cloudflare API calls: one worker invocation, one rate-limit check, and one KV read per record. A device polling every 2 minutes costs ~22k invocations and ~44k KV reads per month per record pair, far inside the Workers paid plan's included 10M requests and 10M KV reads.
 - **Cache misses stay lean.** Token verification and the zone list (cached per token for 5 minutes) front a parallel record lookup; only records whose DNS content actually differs trigger an update call. Audit writes and notifications ride `ctx.waitUntil` after the response.
 - **Strangers are throttled at the edge.** The rate limiter (50 requests/minute per IP, per colo) returns 429 before authentication runs, and an unauthenticated or wrong-key request never reaches the Cloudflare API, KV, or D1. Enforcement is Cloudflare's best-effort, eventually-consistent counter, a cost cap against sustained abuse rather than a precise gate; short bursts can overshoot.
-- **Ballpark beyond included quotas** (Workers paid plan pricing): ~$0.30 per additional 1M requests, ~$0.50 per additional 1M KV reads; D1 audit volume is negligible by design (rows only on actual DNS-touching events).
+- **Ballpark beyond included quotas** (Workers paid plan pricing): ~$0.30 per additional 1M requests, ~$0.50 per additional 1M KV reads; D1 audit volume is negligible by design (rows only on actual DNS-touching events). A refusal costs one Durable Object call and up to two of its storage writes; `GET /history` costs one read-only call.
 
 ## 🛠️ **Testing & Troubleshooting**
 

@@ -40,7 +40,7 @@ export async function writeAuditEvents(env: Env, events: AuditEvent[]): Promise<
 /** Returns the caller's own audit rows, newest first. Tenant isolation is
  * the token ID: callers only ever see events created with their token. */
 export async function queryHistory(env: Env, query: HistoryQuery): Promise<Record<string, unknown>[]> {
-	const limit = Math.min(Math.max(query.limit, 1), HISTORY_MAX_LIMIT);
+	const limit = Math.min(Math.max(Math.trunc(query.limit), 1), HISTORY_MAX_LIMIT);
 	const base = 'SELECT occurred_at, hostname, record_type, previous_ip, new_ip, outcome, caller_ip FROM audit_events WHERE token_id = ?';
 	const statement =
 		query.hostname !== null && query.hostname !== ''
