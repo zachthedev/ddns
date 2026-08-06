@@ -107,6 +107,19 @@ curl -H "Authorization: Bearer <api-token>" -H "X-Access-Key: <access-key-if-set
 
 Cache fast-path hits are not recorded; only requests that reached the DNS API produce events.
 
+Pages are capped at 1000 events. The response carries `data.cursor`, and passing it back as `before=`
+continues from where the page ended; it is `null` on the last page. Treat the value as opaque and pass it
+verbatim, and keep `hostname=` fixed across a walk, since the cursor is a position in the result set the
+page came from. `data.refusedToday` below rides on the first page only, since it describes the day rather
+than the page.
+
+The cursor embeds the audit row's id, which is a table-wide sequence. On a deployment several people share,
+that lets one of them read the total number of audit rows written before their own, and polling it times
+the others' activity. It is aggregate volume, never row contents, and a deployment serving one household
+leaks nothing to itself. Signing the cursor would close it, and that needs a deployment secret this worker
+does not require: `ACCESS_KEY` is optional, and the deployments that leave it unset are the shared ones
+where this matters.
+
 The response also carries `data.refusedToday`: the times this token reached past its own authority today,
 UTC, and the names it reached for.
 
@@ -118,7 +131,8 @@ Reaching past authority means a hostname no zone on the token could hold, or a `
 cannot see. A record you have not created yet is **not** counted, nor is a token missing the Zone Read
 scope, nor is a token that sees no zones at all: those are setup steps, and counting them would bury the
 signal under every new user's first afternoon. The `hostnames` list is your own, so it names exactly which
-of your entries to fix.
+of your entries to fix. It carries 50 of them, the last to be seen for the first time, since a name refused
+again keeps its original place. `distinct` counts every name the tally kept, which itself stops at 200.
 
 Refusals are **counted, not recorded per event**. Any active Cloudflare token can produce them without
 limit, so a row apiece would let one caller grow a table every deployment shares. The tally lives in a

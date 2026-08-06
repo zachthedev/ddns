@@ -7,7 +7,7 @@ import {
 	PermissionDeniedError,
 	RateLimitError,
 } from 'cloudflare';
-import { HISTORY_DEFAULT_LIMIT, queryHistory, writeAuditEvents, type AuditEvent } from './audit';
+import { HISTORY_DEFAULT_LIMIT, parseHistoryCursor, queryHistory, writeAuditEvents, type AuditEvent } from './audit';
 import { pushNtfy } from './pushNtfy';
 import type { RefusalTally } from './refusals';
 export { RefusalCounter } from './refusals';
@@ -149,10 +149,19 @@ async function countRefusals(env: Env, tokenId: string, hostnames: string[]): Pr
 	}
 }
 
+// Names carried in the tally a response reports. The counter keeps up to 200
+// of up to 253 characters each, which would put 50 KiB of them on a response
+// whose point is the audit rows. Taken from the end for the same reason as
+// ALERT_SAMPLE: the list is in the order names were first seen, so the head is
+// whatever the day opened with, and a caller who fixed those would keep reading
+// back the ones already fixed.
+const REFUSED_NAMES_REPORTED = -50;
+
 /** The caller's refusals for today; an unreadable counter reads as none. */
 async function readRefusalTally(env: Env, tokenId: string): Promise<RefusalTally> {
 	try {
-		return await env.REFUSALS.getByName(tokenId).tally(currentDay());
+		const tally = await env.REFUSALS.getByName(tokenId).tally(currentDay());
+		return { ...tally, hostnames: tally.hostnames.slice(REFUSED_NAMES_REPORTED) };
 	} catch (error) {
 		console.error(`Failed to read the refusal tally for token ${tokenId}:`, error);
 		return { total: 0, distinct: 0, hostnames: [] };
@@ -307,8 +316,10 @@ interface HistoryResponseBody {
 	success: boolean;
 	data: {
 		events: Record<string, unknown>[];
-		/** Refusals counted against this token today, UTC. */
-		refusedToday: RefusalTally;
+		/** Pass back as `before` to continue; null when this page is the last. */
+		cursor: string | null;
+		/** Refusals counted against this token today, UTC. Only on the first page. */
+		refusedToday: RefusalTally | null;
 	};
 }
 
@@ -1073,16 +1084,38 @@ async function updateHostnames(
 
 /** GET /history: the caller's own audit rows, newest first. */
 async function handleHistory(auth: ParsedAuth, request: Request, env: Env): Promise<Response> {
+	// Every parameter is checked before the token is verified, so a request that
+	// cannot be answered whatever the token says never spends a Cloudflare API
+	// call, matching how the access key gates the update path.
+	const { searchParams } = new URL(request.url);
+	const hostname = searchParams.get('hostname')?.trim() ?? null;
+	if (hostname !== null && hostname !== '' && (hostname.length > HOSTNAME_MAX_LENGTH || !HOSTNAME_PATTERN.test(hostname))) {
+		// The same shape /update enforces. Without it a typo answers with an
+		// empty page, which reads as "nothing ever happened to that name".
+		throw new HttpError(422, `Not a valid hostname: '${quoteInput(hostname)}'`);
+	}
+	const limitParam = Number(searchParams.get('limit') ?? HISTORY_DEFAULT_LIMIT);
+	const limit = Number.isFinite(limitParam) ? limitParam : HISTORY_DEFAULT_LIMIT;
+	const rawCursor = searchParams.get('before')?.trim() ?? '';
+	const before = rawCursor === '' ? null : parseHistoryCursor(rawCursor);
+	if (before === null && rawCursor !== '') {
+		// Rejected rather than ignored. Ignoring it would answer with the first
+		// page, and a client walking pages would read that as a fresh start and
+		// loop over the same rows forever.
+		throw new HttpError(422, "The 'before' parameter must be a cursor from a previous response.");
+	}
+
 	const cloudflare = apiClient(auth);
 	const tokenId = await verifyToken(cloudflare);
 
-	const { searchParams } = new URL(request.url);
-	const hostname = searchParams.get('hostname')?.trim() ?? null;
-	const limitParam = Number(searchParams.get('limit') ?? HISTORY_DEFAULT_LIMIT);
-	const limit = Number.isFinite(limitParam) ? limitParam : HISTORY_DEFAULT_LIMIT;
-
-	const [events, refusedToday] = await Promise.all([queryHistory(env, { tokenId, hostname, limit }), readRefusalTally(env, tokenId)]);
-	return jsonResponse({ success: true, data: { events, refusedToday } }, 200);
+	// The tally rides on the first page only. It describes the day rather than
+	// the page, so repeating it down a walk would spend one Durable Object round
+	// trip per page to say the same thing.
+	const [page, refusedToday] = await Promise.all([
+		queryHistory(env, { tokenId, hostname, limit, before }),
+		before === null ? readRefusalTally(env, tokenId) : null,
+	]);
+	return jsonResponse({ success: true, data: { events: page.events, cursor: page.cursor, refusedToday } }, 200);
 }
 
 export default {
