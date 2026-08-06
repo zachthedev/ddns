@@ -3354,6 +3354,89 @@ describe('Worker fetch handler', () => {
 			expect(Number.isInteger(bindArgs.at(-1))).toBe(true);
 		});
 
+		it('carries the cursor and the tally on the first page', async () => {
+			const auditDbMock = vi.mocked(env.AUDIT_DB) as any;
+			auditDbMock.prepare().all.mockResolvedValue({
+				results: Array.from({ length: 3 }, (_unused, i) => ({ id: i + 1, occurred_at: `2026-08-06T00:00:00.00${String(i)}Z` })),
+			});
+
+			const request = createMockRequest('https://example.com/history?limit=2', { headers: validAuth });
+			const body = (await (await worker.fetch(request, env, ctx)).json()) as any;
+
+			expect(body.data.cursor).toBe('2026-08-06T00:00:00.001Z|2');
+			expect(body.data.refusedToday).toEqual({ total: 0, distinct: 0, hostnames: [] });
+		});
+
+		it('omits the tally on a continuation page', async () => {
+			// The tally describes the day, not the page. Repeating it down a walk
+			// would spend one Durable Object round trip per page to say the same
+			// thing.
+			const auditDbMock = vi.mocked(env.AUDIT_DB) as any;
+			auditDbMock.prepare().all.mockResolvedValue({ results: [] });
+
+			const request = createMockRequest('https://example.com/history?before=2026-08-06T00%3A00%3A01.000Z%7C2', { headers: validAuth });
+			const body = (await (await worker.fetch(request, env, ctx)).json()) as any;
+
+			expect(body.data.refusedToday).toBeNull();
+			expect((vi.mocked(env.REFUSALS) as any).getByName).not.toHaveBeenCalled();
+		});
+
+		it.each([
+			['a hostname with an embedded newline', 'hostname=a%0Aforged'],
+			['a hostname longer than a DNS name may be', `hostname=${'a'.repeat(250)}.example.com`],
+		])('rejects %s the way /update does', async (_label, query) => {
+			// Unchecked, a typo answers with an empty page, which reads as
+			// "nothing ever happened to that name" rather than "you asked wrong".
+			const request = createMockRequest(`https://example.com/history?${query}`, { headers: validAuth });
+
+			const response = await worker.fetch(request, env, ctx);
+			const body = (await response.json()) as any;
+
+			expect(response.status).toBe(422);
+			expect(body.error).toContain('Not a valid hostname');
+		});
+
+		it('rejects a bad parameter without spending a Cloudflare API call', async () => {
+			// A request no token could answer should cost nothing beyond the
+			// worker invocation, which is the same bargain the access key strikes.
+			const request = createMockRequest('https://example.com/history?before=garbage', { headers: validAuth });
+
+			await worker.fetch(request, env, ctx);
+
+			expect(mockCloudflareClient.user.tokens.verify).not.toHaveBeenCalled();
+		});
+
+		it('rejects a cursor it did not emit rather than restarting the walk', async () => {
+			// Ignoring it would answer with the first page, and a client walking
+			// pages would read that as a fresh start and loop over the same rows.
+			const request = createMockRequest('https://example.com/history?before=garbage', { headers: validAuth });
+
+			const response = await worker.fetch(request, env, ctx);
+			const body = (await response.json()) as any;
+
+			expect(response.status).toBe(422);
+			expect(body.error).toContain("'before' parameter must be a cursor");
+		});
+
+		it('reports at most fifty refused names however many the counter holds', async () => {
+			// The counter keeps up to 200 of up to 253 characters, which would put
+			// 50 KiB of them on a response whose point is the audit rows.
+			const stub = (vi.mocked(env.REFUSALS) as any).getByName('token-id-123');
+			stub.tally.mockResolvedValue({
+				total: 400,
+				distinct: 200,
+				hostnames: Array.from({ length: 200 }, (_unused, i) => `h${String(i)}.example.com`),
+			});
+
+			const request = createMockRequest('https://example.com/history', { headers: validAuth });
+			const body = (await (await worker.fetch(request, env, ctx)).json()) as any;
+
+			expect(body.data.refusedToday.hostnames).toHaveLength(50);
+			// The true count still reaches the caller, so a truncated list never
+			// reads as the whole story.
+			expect(body.data.refusedToday.distinct).toBe(200);
+		});
+
 		it('returns 200 with events array using default limit of 100', async () => {
 			const auditDbMock = vi.mocked(env.AUDIT_DB) as any;
 			const stmtMock = auditDbMock.prepare();
@@ -3374,7 +3457,7 @@ describe('Worker fetch handler', () => {
 				data: { events: [{ hostname: 'test.example.com', outcome: 'updated' }] },
 			});
 			// token_id bound first, then limit (100) — no hostname in the middle
-			expect(stmtMock.bind).toHaveBeenCalledWith('token-id-123', 100);
+			expect(stmtMock.bind).toHaveBeenCalledWith('token-id-123', 101);
 		});
 
 		it('respects an explicit limit parameter', async () => {
@@ -3388,7 +3471,7 @@ describe('Worker fetch handler', () => {
 
 			await worker.fetch(request, env, ctx);
 
-			expect(stmtMock.bind).toHaveBeenCalledWith('token-id-123', 25);
+			expect(stmtMock.bind).toHaveBeenCalledWith('token-id-123', 26);
 		});
 
 		it('clamps limit to 1000 when the provided value exceeds the maximum', async () => {
@@ -3402,7 +3485,7 @@ describe('Worker fetch handler', () => {
 
 			await worker.fetch(request, env, ctx);
 
-			expect(stmtMock.bind).toHaveBeenCalledWith('token-id-123', 1000);
+			expect(stmtMock.bind).toHaveBeenCalledWith('token-id-123', 1001);
 		});
 
 		it('clamps limit to 1 when the provided value is less than 1', async () => {
@@ -3416,7 +3499,7 @@ describe('Worker fetch handler', () => {
 
 			await worker.fetch(request, env, ctx);
 
-			expect(stmtMock.bind).toHaveBeenCalledWith('token-id-123', 1);
+			expect(stmtMock.bind).toHaveBeenCalledWith('token-id-123', 2);
 		});
 
 		it('falls back to default limit when limit param is non-numeric', async () => {
@@ -3430,7 +3513,7 @@ describe('Worker fetch handler', () => {
 
 			await worker.fetch(request, env, ctx);
 
-			expect(stmtMock.bind).toHaveBeenCalledWith('token-id-123', 100);
+			expect(stmtMock.bind).toHaveBeenCalledWith('token-id-123', 101);
 		});
 
 		it('filters by hostname when the hostname query param is provided', async () => {
@@ -3445,7 +3528,7 @@ describe('Worker fetch handler', () => {
 			await worker.fetch(request, env, ctx);
 
 			// When hostname is set: token_id, hostname, limit are all bound in that order
-			expect(stmtMock.bind).toHaveBeenCalledWith('token-id-123', 'test.example.com', 100);
+			expect(stmtMock.bind).toHaveBeenCalledWith('token-id-123', 'test.example.com', 101);
 		});
 
 		it('returns 405 for non-GET requests to /history', async () => {
