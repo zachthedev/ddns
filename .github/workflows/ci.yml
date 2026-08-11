@@ -4,8 +4,10 @@ permissions:
   contents: read
 
 on:
+  # Every pull request, whatever it targets. A stacked pull request is based on
+  # the layer below it rather than on main, and filtering by base branch leaves
+  # each middle layer reviewed with no checks against it.
   pull_request:
-    branches: [main]
   push:
     branches: [main]
 
