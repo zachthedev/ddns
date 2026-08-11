@@ -11,8 +11,9 @@ the Cloudflare Workers pool, ESLint + prettier, lefthook hooks.
 - Verify everything: `bun run check:all`
 - Deploy (local or CI): `bun run deploy` (see scripts/deploy.ts)
 - First-time setup on a clone or fork: `bun run setup`
-- Dependency overrides: `package.json` pins a few security-patched transitives. On every dependency
-  bump, recheck whether each is still needed and drop the stale ones (see docs/dependency-overrides.md).
+- Dependency overrides: `package.json` carries no `overrides` block, and that is the state to return to.
+  A `bun audit` failure is usually a stale lockfile, so re-resolve before pinning anything
+  (see docs/dependency-overrides.md).
 
 Cloudflare resource naming: `<type>-<project>-<purpose>-<env>`, e.g.
 `kv-uddns-cache-prod`, `kv-uddns-cache-dev`, `d1-uddns-audit-prod`. Binding
