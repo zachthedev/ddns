@@ -2,10 +2,18 @@ version: 2
 updates:
   - package-ecosystem: 'bun'
     directory: '/'
-    # Security-patched transitive pins live in package.json "overrides". On each
-    # grouped bump, recheck whether they can be dropped: docs/dependency-overrides.md
+    # A bun audit failure is usually a stale lockfile rather than a missing
+    # pin in package.json "overrides": docs/dependency-overrides.md
     schedule:
       interval: 'weekly'
+    # release-please reads these prefixes. A runtime bump changes what the
+    # deployed Worker contains, so `fix` puts it in a release and gets it to
+    # production; without a releasable type it would sit on main until an
+    # unrelated change happened to cut a version. Development bumps change
+    # only how the Worker is built and tested, so they stay out of releases.
+    commit-message:
+      prefix: 'fix'
+      prefix-development: 'chore'
     # Wait out the publish-then-pull window before proposing new versions.
     cooldown:
       default-days: 3

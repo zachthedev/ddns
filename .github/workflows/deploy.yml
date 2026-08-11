@@ -3,19 +3,52 @@ name: Deploy
 permissions:
   contents: read
 
-# Releases deploy, pushes do not. The deploy applies D1 migrations, so tying
-# it to a tag is what makes the schema in production correspond to a revision
+# Releases deploy, pushes do not. The deploy applies D1 migrations, so tying it
+# to a release is what makes the schema in production correspond to a revision
 # anyone can check out, rather than to whichever commit last reached main.
+#
+# release-please owns the only automatic path here: merging its release pull
+# request tags the commit, publishes the Release, and calls this. Manual runs
+# take a ref, which covers deploying a revision without releasing one.
 on:
-  push:
-    tags:
-      - 'v*.*.*'
+  # Named one by one rather than inherited, so a secret added to the repo later
+  # does not reach a job that runs install hooks and a build. Optional here
+  # means scripts/deploy.ts has a defined behaviour without it: the preview
+  # namespace falls back to the production one, a missing domain leaves the
+  # route alone, and a missing access key skips the secret sync.
+  workflow_call:
+    secrets:
+      CLOUDFLARE_API_TOKEN:
+        required: true
+      CLOUDFLARE_ACCOUNT_ID:
+        required: true
+      KV_NAMESPACE_ID:
+        required: true
+      D1_DATABASE_ID:
+        required: true
+      KV_NAMESPACE_PREVIEW_ID:
+        required: false
+      CUSTOM_DOMAIN:
+        required: false
+      ACCESS_KEY:
+        required: false
   workflow_dispatch:
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    # Named so the deploy shows up as a deployment and can carry protection
+    # rules. Both paths into production run through here.
+    environment: production
+    # On the job rather than the workflow, so it holds when this runs as a
+    # called workflow too. The deploy applies D1 migrations, which read the
+    # applied-migrations table and then write: two overlapping runs can each
+    # see the same migration as pending, and the later upload decides which
+    # revision production ends up on.
+    concurrency:
+      group: deploy-production
+      cancel-in-progress: false
 
     steps:
       - name: Checkout repository
@@ -23,12 +56,17 @@ jobs:
 
       - name: Setup Bun
         uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          # Pinned to packageManager, so the revision that reached production
+          # was built by the bun the lockfile was resolved with.
+          bun-version-file: package.json
 
       - name: Install dependencies
         run: bun install --frozen-lockfile
 
-      # A tag has no pull request behind it, so nothing else would have run
-      # these against the exact revision about to reach production.
+      # A manual run takes any ref, so nothing else has necessarily run these
+      # against the revision about to reach production. Cheap enough to run on
+      # the release path too, where it re-checks the merge commit.
       - name: Verify
         run: bun run check:all
 

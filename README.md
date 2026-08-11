@@ -70,17 +70,35 @@ these repository secrets:
 - `D1_DATABASE_ID` - Audit database ID (from `.env.local`)
 - `ACCESS_KEY` - Optional; locks the worker to callers that present it
 
-Pushing a `v*.*.*` tag then verifies and deploys that revision:
+Releases then deploy, and pushes do not. Deploys apply the D1 migrations, so
+tying one to a release means the schema in production corresponds to a revision
+you can check out, instead of to whichever commit landed last.
 
-```sh
-git tag v1.0.1
-git push origin v1.0.1
-```
+[release-please](https://github.com/googleapis/release-please) drives it. Once a
+releasable change lands on `main`, it opens one pull request titled
+`chore(main): release x.y.z` and keeps it up to date, carrying the version bump
+and the changelog entries for everything landed since the last release. Nothing
+ships while it sits there. Merging it is the release: the merge commit is
+tagged, the GitHub Release is published, and the deploy runs against that
+revision.
 
-Tags rather than every push to `main`, because the deploy applies the D1
-migrations. Tying it to a tag means the schema in production corresponds to a
-revision you can check out, instead of to whichever commit landed last. Use the
-workflow's manual run to deploy without cutting a tag.
+So the release cadence is yours. Land as many changes as you like, then merge
+the release pull request when you want a version. Version numbers come from the
+[Conventional Commits](https://www.conventionalcommits.org/) in the range. A
+`!` or a `BREAKING CHANGE:` footer gives a major and a `feat:` gives a minor.
+Every other type that appears in the changelog gives a patch: `fix`, `perf`,
+`refactor`, `docs`, `build`, and `revert`. The types kept out of the changelog
+(`chore`, `ci`, `test`, `style`) release nothing at all, so a `main` carrying
+only those has no release pull request open.
+
+Use the Deploy workflow's manual run to deploy a revision without releasing one.
+
+Two mechanics are worth knowing. The release tag is created by the workflow's
+own token, and GitHub starts no workflow run from one, which is why the Release
+workflow calls the deploy directly instead of leaving it on a tag trigger, and
+why a tag pushed by hand deploys nothing. For the same reason the release pull
+request itself gets no CI run, so `bun run check:all` runs against the merge
+commit before anything is tagged.
 
 Notifications need no deployment configuration: callers pass their own ntfy
 target with the `ntfy=` query parameter.
