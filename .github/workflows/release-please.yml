@@ -76,4 +76,11 @@ jobs:
     # cannot reach deploy.yml through a trigger of its own, so this calls it.
     # One deploy definition either way, rather than a second copy of the steps.
     uses: ./.github/workflows/deploy.yml
-    secrets: inherit
+    secrets:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      KV_NAMESPACE_ID: ${{ secrets.KV_NAMESPACE_ID }}
+      D1_DATABASE_ID: ${{ secrets.D1_DATABASE_ID }}
+      KV_NAMESPACE_PREVIEW_ID: ${{ secrets.KV_NAMESPACE_PREVIEW_ID }}
+      CUSTOM_DOMAIN: ${{ secrets.CUSTOM_DOMAIN }}
+      ACCESS_KEY: ${{ secrets.ACCESS_KEY }}

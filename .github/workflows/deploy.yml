@@ -11,7 +11,27 @@ permissions:
 # request tags the commit, publishes the Release, and calls this. Manual runs
 # take a ref, which covers deploying a revision without releasing one.
 on:
+  # Named one by one rather than inherited, so a secret added to the repo later
+  # does not reach a job that runs install hooks and a build. Optional here
+  # means scripts/deploy.ts has a defined behaviour without it: the preview
+  # namespace falls back to the production one, a missing domain leaves the
+  # route alone, and a missing access key skips the secret sync.
   workflow_call:
+    secrets:
+      CLOUDFLARE_API_TOKEN:
+        required: true
+      CLOUDFLARE_ACCOUNT_ID:
+        required: true
+      KV_NAMESPACE_ID:
+        required: true
+      D1_DATABASE_ID:
+        required: true
+      KV_NAMESPACE_PREVIEW_ID:
+        required: false
+      CUSTOM_DOMAIN:
+        required: false
+      ACCESS_KEY:
+        required: false
   workflow_dispatch:
 
 jobs:
