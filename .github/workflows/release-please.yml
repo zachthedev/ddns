@@ -1,0 +1,79 @@
+name: Release
+
+# A push to main updates one open release pull request; it does not cut a
+# version. That pull request carries the version bump and the changelog entries
+# for everything landed since the last release, so merging it is the act that
+# releases. release-please then tags the merge commit, publishes the GitHub
+# Release, and the deploy job below ships that revision.
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+# Two pushes landing together would otherwise race to write the same release
+# pull request. Queued rather than cancelled, so the later push still gets its
+# commits into the release notes.
+concurrency:
+  group: release-main
+  cancel-in-progress: false
+
+jobs:
+  # Ahead of the release, not after it. A tag and a GitHub Release cannot be
+  # withdrawn once published, so the only useful place for the gate is before
+  # they exist. This also covers the release pull request itself: it is opened
+  # by GITHUB_TOKEN, and GitHub starts no workflow run for such a pull request,
+  # so the merge commit reaches here having never been checked.
+  verify:
+    name: Verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version-file: package.json
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Verify
+        run: bun run check:all
+
+  release:
+    name: Release PR
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      pull-requests: write
+      # Labels live on the issues API, and release-please marks its own pull
+      # request with `autorelease:` labels to track which release it describes.
+      issues: write
+    outputs:
+      released: ${{ steps.release-please.outputs.release_created }}
+
+    steps:
+      - name: Run release-please
+        id: release-please
+        uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
+        with:
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+
+  deploy:
+    name: Deploy
+    needs: release
+    if: needs.release.outputs.released == 'true'
+    # A tag pushed by GITHUB_TOKEN starts no workflow run, which is GitHub's
+    # guard against a workflow triggering itself. The release tag therefore
+    # cannot reach deploy.yml through a trigger of its own, so this calls it.
+    # One deploy definition either way, rather than a second copy of the steps.
+    uses: ./.github/workflows/deploy.yml
+    secrets: inherit
