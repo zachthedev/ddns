@@ -1,0 +1,6 @@
+# The main ruleset requires a code owner review. Without this file no path has
+# an owner, so that requirement passes on every pull request and protects
+# nothing. One owner over everything is the honest description of the repository
+# today, and it auto-requests a review on anything a contributor opens.
+
+* @zachthedev
