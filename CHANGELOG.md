@@ -2,6 +2,13 @@
 
 # Changelog
 
+## [1.0.1](https://github.com/zachthedev/uddns/compare/v1.0.0...v1.0.1) (2026-08-11)
+
+
+### Bug Fixes
+
+* **refusals:** bound the counted day window against the clock ([#189](https://github.com/zachthedev/uddns/issues/189)) ([236e811](https://github.com/zachthedev/uddns/commit/236e811893303cbc010bae0dcae818631a3c256c))
+
 ## 1.0.0 (2026-08-06)
 
 First tagged release. The worker had been deployed from `main` before this; the tag is what makes a
