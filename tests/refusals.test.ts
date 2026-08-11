@@ -2,14 +2,27 @@ import { env } from 'cloudflare:workers';
 import { runDurableObjectAlarm } from 'cloudflare:test';
 import { describe, it, expect } from 'vitest';
 
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * A day that many days from the current UTC one, the way the worker stamps it.
+ *
+ * The object holds a tally only while that day's reclaim deadline is still
+ * ahead of the clock, so a day fixed in the source stops being one the object
+ * accepts as soon as the clock passes it.
+ */
+const dayAt = (offset: number): string => new Date(Date.now() + offset * DAY_MS).toISOString().slice(0, 10);
+
+const yesterday = dayAt(-1);
+const today = dayAt(0);
+const tomorrow = dayAt(1);
+
 /**
  * Exercised against a real Durable Object rather than a stub: the reason this
  * counter is a DO at all is that instance requests serialize, and a stub would
  * assert that property rather than test it.
  */
 describe('RefusalCounter', () => {
-	const today = '2026-08-06';
-
 	it('reports nothing for a token it has never seen', async () => {
 		await expect(env.REFUSALS.getByName('fresh-token').tally(today)).resolves.toEqual({ total: 0, distinct: 0, hostnames: [] });
 	});
@@ -70,11 +83,15 @@ describe('RefusalCounter', () => {
 
 	it('starts over when the day rolls', async () => {
 		const counter = env.REFUSALS.getByName('rolling-token');
-		await counter.add('2026-08-05', ['old.example.com', 'older.example.com']);
+		await counter.add(yesterday, ['old.example.com', 'older.example.com']);
+		// The roll is only under test if there is a tally to roll off. The day
+		// window is measured against the clock, so a yesterday the object turns
+		// away would leave the assertion below true for the wrong reason.
+		await expect(counter.tally(yesterday)).resolves.toMatchObject({ total: 2 });
 
-		await counter.add('2026-08-06', ['new.example.com']);
+		await counter.add(today, ['new.example.com']);
 
-		await expect(counter.tally('2026-08-06')).resolves.toEqual({
+		await expect(counter.tally(today)).resolves.toEqual({
 			total: 1,
 			distinct: 1,
 			hostnames: ['new.example.com'],
@@ -83,9 +100,10 @@ describe('RefusalCounter', () => {
 
 	it('reports nothing for a day it holds no tally for', async () => {
 		const counter = env.REFUSALS.getByName('stale-token');
-		await counter.add('2026-08-05', ['old.example.com']);
+		await counter.add(yesterday, ['old.example.com']);
+		await expect(counter.tally(yesterday)).resolves.toMatchObject({ total: 1 });
 
-		await expect(counter.tally('2026-08-06')).resolves.toEqual({ total: 0, distinct: 0, hostnames: [] });
+		await expect(counter.tally(today)).resolves.toEqual({ total: 0, distinct: 0, hostnames: [] });
 	});
 
 	it('stops collecting names at the cap while the total keeps climbing', async () => {
@@ -120,8 +138,6 @@ describe('RefusalCounter', () => {
 });
 
 describe('RefusalCounter guards', () => {
-	const today = '2026-08-06';
-
 	it.each([
 		['an empty list', []],
 		['entries that are not names', ['', '']],
@@ -201,13 +217,17 @@ describe('RefusalCounter guards', () => {
 		['a day that is not a date', 'yesterday'],
 		['a day out of range', '2026-13-45'],
 		['a timestamp rather than a day', '2026-08-06T12:00:00Z'],
-		// The alarm anchor is the day plus the reclaim window, and the platform
-		// refuses to schedule past 2189. The pattern alone would admit this.
-		['a day past the furthest alarm', '9999-12-31'],
+		// The pattern alone would admit these. A day the object stores ahead of
+		// the clock sits above every later call, so each reads as a straggler
+		// and the tally goes dark for the life of the instance. The nearer one
+		// is the one worth pinning: it is a plausible date, and an alarm can be
+		// scheduled against it.
+		['a day ahead of the window', '2100-01-01'],
+		['a day far ahead of the window', '9999-12-31'],
 	])('ignores %s rather than poisoning the tally', async (_label, day) => {
 		// The day reaches both a lexicographic comparison and the alarm anchor,
-		// where a value this does not admit would compare wrong or make setAlarm
-		// throw.
+		// where a value this does not admit would compare wrong, make setAlarm
+		// throw, or delete what it stores.
 		const counter = env.REFUSALS.getByName(`day-guard-${day}`);
 		await counter.add(today, ['real.example.com']);
 
@@ -216,18 +236,43 @@ describe('RefusalCounter guards', () => {
 		await expect(counter.tally(today)).resolves.toMatchObject({ total: 1, distinct: 1 });
 	});
 
+	it('refuses a day whose reclaim window already passed', async () => {
+		// The other end of the alarm anchor, and it needs an instance holding no
+		// tally: with one, the straggler check answers first and the day never
+		// reaches setAlarm. On a fresh instance nothing else stands between the
+		// two, so admitting the day would arm the alarm behind the clock and
+		// clear the tally the same call wrote.
+		const counter = env.REFUSALS.getByName('expired-day-token');
+		const expired = dayAt(-3);
+
+		await expect(counter.add(expired, ['stale.example.com'])).resolves.toEqual({
+			total: 0,
+			distinct: 0,
+			hostnames: [],
+			alert: false,
+		});
+
+		await expect(counter.tally(expired)).resolves.toEqual({ total: 0, distinct: 0, hostnames: [] });
+	});
+
 	it('ignores a call stamped with an older day', async () => {
 		// The caller stamps the day and its RPC can land out of order, so a
 		// straggler from yesterday must not reset today.
 		const counter = env.REFUSALS.getByName('straggler-token');
-		await counter.add('2026-08-06', ['today.example.com']);
+		await counter.add(today, ['today.example.com']);
 
-		await counter.add('2026-08-05', ['yesterday.example.com']);
+		await counter.add(yesterday, ['yesterday.example.com']);
 
-		await expect(counter.tally('2026-08-06')).resolves.toEqual({
+		await expect(counter.tally(today)).resolves.toEqual({
 			total: 1,
 			distinct: 1,
 			hostnames: ['today.example.com'],
+		});
+		// Which of the two refusals answered matters, and both return the same
+		// empty tally. The control pins it on the straggler check: the same day
+		// counts normally against an instance holding nothing above it.
+		await expect(env.REFUSALS.getByName('straggler-control').add(yesterday, ['yesterday.example.com'])).resolves.toMatchObject({
+			total: 1,
 		});
 	});
 
@@ -245,9 +290,9 @@ describe('RefusalCounter guards', () => {
 	it('raises the alert again once the day rolls', async () => {
 		// The flag is part of the day's tally, so a new day starts silent.
 		const counter = env.REFUSALS.getByName('alert-rolling-token');
-		await counter.add('2026-08-06', names(100, 'a'));
+		await counter.add(today, names(100, 'a'));
 
-		await expect(counter.add('2026-08-07', names(100, 'a'))).resolves.toMatchObject({ alert: true });
+		await expect(counter.add(tomorrow, names(100, 'a'))).resolves.toMatchObject({ alert: true });
 	});
 
 	it('raises the alert on the next call when one is lost after the write', async () => {

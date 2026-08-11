@@ -42,8 +42,10 @@ export interface RefusalUpdate extends RefusalTally {
 
 const STATE_KEY = 'count';
 
+const DAY_MS = 24 * 60 * 60 * 1000;
+
 /** How long past a tally's own day an instance keeps it before clearing. */
-const RECLAIM_AFTER_DAY_MS = 48 * 60 * 60 * 1000;
+const RECLAIM_AFTER_DAY_MS = 2 * DAY_MS;
 
 /**
  * Distinct names kept per day. The names come from the caller, so this set is
@@ -89,21 +91,34 @@ export const ALERT_DISTINCT = 100;
 
 const DAY_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
 
-/** Furthest alarm the platform accepts, which rules out a far-future day. */
-const ALARM_LATEST_MS = Date.parse('2189-01-01T00:00:00.000Z');
-
 /**
- * The day is stamped by the caller and reaches both a lexicographic comparison
- * and the alarm anchor, so one this does not admit would either compare wrong
- * or make `setAlarm` throw: on NaN from an unparseable date, and on a date past
- * the ceiling the platform will schedule against.
+ * Whether a day is one this object will count, measured against the clock the
+ * caller stamps from.
+ *
+ * A day is a lexicographic comparison and an alarm anchor, and each end of the
+ * window answers one of them. Behind the window, the alarm arms behind the
+ * clock, so the tally written under that day is cleared on the way out. Ahead
+ * of it, the stored day sits above every later call, each of which then reads
+ * as a straggler: one such write takes the tally dark for the life of the
+ * instance. The far end also keeps the alarm inside the ceiling the platform
+ * will schedule against.
+ *
+ * The near end reaches back a full reclaim period rather than a day, because a
+ * request that stamps its day just before midnight can land just after, and
+ * that straggler has to arrive as one. The one caller stamps the current day,
+ * whose ends sit a day clear of the window either way, so this is a backstop
+ * rather than a line production approaches.
  */
 function isDay(value: string): boolean {
 	if (!DAY_PATTERN.test(value)) {
 		return false;
 	}
 	const anchor = Date.parse(`${value}T00:00:00.000Z`);
-	return !Number.isNaN(anchor) && anchor + RECLAIM_AFTER_DAY_MS < ALARM_LATEST_MS;
+	if (Number.isNaN(anchor)) {
+		return false;
+	}
+	const now = Date.now();
+	return anchor + RECLAIM_AFTER_DAY_MS > now && anchor < now + DAY_MS;
 }
 
 /** Stored state is read back as unknown: a shape that does not match is absent. */
@@ -162,7 +177,17 @@ export class RefusalCounter extends DurableObject<Env> {
 		const names = hostnames
 			.slice(0, DISTINCT_NAMES_MAX)
 			.filter((name) => typeof name === 'string' && name !== '' && name.length <= NAME_MAX_LENGTH);
-		if (!isDay(day) || names.length === 0) {
+		if (!isDay(day)) {
+			// The caller stamps the current day, so reaching here says its clock
+			// disagrees with this object's. Worth a line precisely because it
+			// should not happen: the tally answers only through `/history`,
+			// scoped to the token being counted, so a counter that stops
+			// counting looks exactly like a quiet one. The day is escaped and
+			// cut, since the value reaching here matched nothing.
+			console.warn('refusals: ignoring a day outside the counted window', JSON.stringify(day).slice(0, 40));
+			return EMPTY;
+		}
+		if (names.length === 0) {
 			return EMPTY;
 		}
 		const stored = await this.ctx.storage.get(STATE_KEY);
